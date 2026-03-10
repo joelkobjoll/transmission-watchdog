@@ -112,34 +112,6 @@ export async function waitForVpnConnected(
   return null;
 }
 
-/**
- * Checks if Transmission's RPC endpoint is reachable from *inside* the VPN
- * container (which shares the network namespace with the transmission-vpn
- * container).  A response on port 9091 — even a 409 — means the process is
- * alive; only a connection-refused / timeout indicates it is dead.
- *
- * This distinguishes "TX is busy doing a file move" (external timeout but
- * internal success) from "TX process has crashed" (internal failure too).
- */
-export async function checkTransmissionInternalHealth(): Promise<boolean> {
-  const txPort = process.env.TRANSMISSION_PORT ?? "9091";
-  try {
-    const result = await execInContainer(VPN_CONTAINER_NAME, [
-      "wget",
-      "-qO-",
-      "--timeout=5",
-      `http://localhost:${txPort}/transmission/rpc`,
-    ]);
-    // wget exits 0 (success) or 8 (server error, e.g. 409 from Transmission).
-    // Both mean the process is alive and responding.
-    // Exit code 1 = generic error, 4 = network failure, 5 = SSL error.
-    // We treat exit codes 0 and 8 as "alive".
-    return result.exitCode === 0 || result.exitCode === 8;
-  } catch {
-    return false;
-  }
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

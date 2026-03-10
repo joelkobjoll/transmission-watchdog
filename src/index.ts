@@ -7,15 +7,6 @@ import {
   getContainerState,
 } from "./docker";
 import {
-  checkHealth,
-  getAllTorrentIds,
-  stopAllTorrents,
-  startAllTorrents,
-  getSessionPeerPort,
-  setSessionPeerPort,
-  checkTrackerConnectivity,
-} from "./transmission";
-import {
   VPN_CONTAINER_NAME,
   checkVpnRunning,
   checkVpnInternet,
@@ -23,27 +14,50 @@ import {
   getForwardedPort,
   waitForVpnConnected,
   waitForVpnInternet,
-  checkTransmissionInternalHealth,
 } from "./vpn";
 import { log, logBanner } from "./logger";
+import type { TorrentClient } from "./torrent-client";
+import {
+  transmissionClient,
+  TRANSMISSION_CONTAINER_NAME,
+} from "./transmission";
+import { qbittorrentClient, QBITTORRENT_CONTAINER_NAME } from "./qbittorrent";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-const CONTAINER_NAME = process.env.CONTAINER_NAME ?? "transmission-vpn";
+/**
+ * Comma-separated list of clients to monitor.
+ * Valid values: "transmission", "qbittorrent"
+ * Leave empty (or omit) to monitor no torrent client (VPN-only mode).
+ * Examples: "transmission"  |  "qbittorrent"  |  "transmission,qbittorrent"  |  ""
+ */
+const TORRENT_CLIENTS_ENV = process.env.TORRENT_CLIENTS ?? "transmission";
+
+const activeClients: TorrentClient[] = TORRENT_CLIENTS_ENV.split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean)
+  .map((name) => {
+    if (name === "transmission") return transmissionClient;
+    if (name === "qbittorrent") return qbittorrentClient;
+    throw new Error(
+      `Unknown TORRENT_CLIENTS entry: "${name}". Valid values: transmission, qbittorrent`,
+    );
+  });
+
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS ?? 300_000);
 const RECOVERY_WAIT_MS = Number(process.env.RECOVERY_WAIT_MS ?? 600_000);
 const RESTART_POLL_INTERVAL_MS = Number(
   process.env.RESTART_POLL_INTERVAL_MS ?? 10_000,
 );
 const RESTART_MAX_ATTEMPTS = Number(process.env.RESTART_MAX_ATTEMPTS ?? 30);
-// How many consecutive external RPC failures before we investigate further
-const TX_HEALTH_RETRIES = Number(process.env.TX_HEALTH_RETRIES ?? 3);
+// How many consecutive external API failures before we investigate further
+const CLIENT_HEALTH_RETRIES = Number(process.env.TX_HEALTH_RETRIES ?? 3);
 // How long to wait between those quick-retry checks (default 2 min)
-const TX_HEALTH_RETRY_INTERVAL_MS = Number(
+const CLIENT_HEALTH_RETRY_INTERVAL_MS = Number(
   process.env.TX_HEALTH_RETRY_INTERVAL_MS ?? 120_000,
 );
-// How long to wait for TX container to stop before proceeding anyway
-const TX_STOP_MAX_ATTEMPTS = 12;
+// How long to wait for a client container to stop before proceeding anyway
+const CLIENT_STOP_MAX_ATTEMPTS = 12;
 const VPN_PORT_FORWARDING_ENABLED =
   (process.env.VPN_PORT_FORWARDING_ENABLED ?? "true").toLowerCase() === "true";
 
@@ -55,47 +69,55 @@ function sleep(ms: number): Promise<void> {
 
 // ─── State machine ───────────────────────────────────────────────────────────
 
-type State = "MONITORING" | "TX_RESTARTING" | "VPN_RESTARTING" | "RECOVERY";
+type State =
+  | { tag: "MONITORING" }
+  | { tag: "CLIENT_RESTARTING"; client: TorrentClient }
+  | { tag: "VPN_RESTARTING" }
+  | { tag: "RECOVERY"; clients: TorrentClient[] };
 
 // ─── VPN recovery ─────────────────────────────────────────────────────────────
 
 /**
  * Full VPN recovery sequence:
- *  1. Stop TX container gracefully (it shares VPN network namespace)
+ *  1. Stop all torrent client containers (they share the VPN network namespace)
  *  2. Restart VPN container
  *  3. Wait for VPN internet + forwarded port
- *  4. Start TX container
- *  5. Wait for TX RPC to respond
- *  6. Update peer-port in Transmission to match new forwarded port
+ *  4. Start all client containers
+ *  5. Wait for all clients' APIs to respond
+ *  6. Update peer-port in each client to match the new forwarded port
  *
- * Returns true on success → RECOVERY state; false → back to MONITORING after cooldown.
+ * Returns true on success → RECOVERY state; false → back to MONITORING.
  */
-async function handleVpnRestart(): Promise<boolean> {
+async function handleVpnRestart(clients: TorrentClient[]): Promise<boolean> {
   logBanner(
     "⟳  VPN_RESTARTING",
-    `Stopping ${CONTAINER_NAME} before restarting VPN`,
+    clients.length > 0
+      ? `Stopping ${clients.map((c) => c.containerName).join(", ")} before restarting VPN`
+      : "Restarting VPN container",
   );
 
-  // 1. Stop TX so it doesn't corrupt in-progress writes when VPN restarts
-  log("INFO", `Stopping ${CONTAINER_NAME}...`);
-  try {
-    await stopContainer(CONTAINER_NAME);
-  } catch (err) {
-    log("WARN", `Could not stop ${CONTAINER_NAME}: ${err} — proceeding anyway`);
-  }
-
-  const stopped = await waitForContainerStopped(
-    CONTAINER_NAME,
-    TX_STOP_MAX_ATTEMPTS,
-    RESTART_POLL_INTERVAL_MS,
-  );
-  if (!stopped) {
-    log(
-      "WARN",
-      `${CONTAINER_NAME} did not stop within timeout — proceeding with VPN restart anyway`,
+  // 1. Stop all client containers gracefully
+  for (const client of clients) {
+    log("INFO", `Stopping ${client.containerName}...`);
+    try {
+      await stopContainer(client.containerName);
+    } catch (err) {
+      log(
+        "WARN",
+        `Could not stop ${client.containerName}: ${err} — proceeding anyway`,
+      );
+    }
+    const stopped = await waitForContainerStopped(
+      client.containerName,
+      CLIENT_STOP_MAX_ATTEMPTS,
+      RESTART_POLL_INTERVAL_MS,
     );
-  } else {
-    log("OK", `${CONTAINER_NAME} stopped cleanly`);
+    if (stopped) log("OK", `${client.containerName} stopped cleanly`);
+    else
+      log(
+        "WARN",
+        `${client.containerName} did not stop within timeout — proceeding anyway`,
+      );
   }
 
   // 2. Restart VPN container
@@ -146,49 +168,77 @@ async function handleVpnRestart(): Promise<boolean> {
     log("OK", `VPN connected — external IP: ${externalIp ?? "unknown"}`);
   }
 
-  // 4. Start TX container
-  log("INFO", `Starting ${CONTAINER_NAME}...`);
-  try {
-    await startContainer(CONTAINER_NAME);
-  } catch (err) {
-    log("ERROR", `Failed to start ${CONTAINER_NAME}: ${err}`);
-    return false;
+  if (clients.length === 0) return true;
+
+  // 4. Start all client containers
+  for (const client of clients) {
+    log("INFO", `Starting ${client.containerName}...`);
+    try {
+      await startContainer(client.containerName);
+    } catch (err) {
+      log(
+        "ERROR",
+        `Failed to start ${client.containerName}: ${err} — continuing with other clients`,
+      );
+    }
   }
 
-  // 5. Poll for TX RPC
+  // 5. Poll until all clients are healthy
   log(
     "INFO",
-    `Polling Transmission RPC (up to ${RESTART_MAX_ATTEMPTS} attempts)...`,
+    `Polling ${clients.map((c) => c.clientName).join(", ")} (up to ${RESTART_MAX_ATTEMPTS} attempts)...`,
   );
+  const clientsUp = new Set<string>();
   for (let attempt = 1; attempt <= RESTART_MAX_ATTEMPTS; attempt++) {
     await sleep(RESTART_POLL_INTERVAL_MS);
-    const containerState = await getContainerState(CONTAINER_NAME);
-    const healthy = await checkHealth();
-    log(
-      healthy ? "OK" : "INFO",
-      `[${attempt}/${RESTART_MAX_ATTEMPTS}] container: ${containerState ?? "unknown"} · RPC: ${healthy ? "UP" : "DOWN"}`,
+    await Promise.all(
+      clients
+        .filter((c) => !clientsUp.has(c.containerName))
+        .map(async (client) => {
+          const [containerState, healthy] = await Promise.all([
+            getContainerState(client.containerName),
+            client.checkHealth(),
+          ]);
+          log(
+            healthy ? "OK" : "INFO",
+            `[${attempt}/${RESTART_MAX_ATTEMPTS}] ${client.clientName}: container=${containerState ?? "unknown"} · API=${healthy ? "UP" : "DOWN"}`,
+          );
+          if (healthy) {
+            clientsUp.add(client.containerName);
+            log("OK", `${client.clientName} is back online`);
+          }
+        }),
     );
-    if (healthy) {
-      log("OK", "Transmission RPC is back online");
-      // 6. Sync peer-port (only if port forwarding is enabled)
+    if (clientsUp.size === clients.length) {
+      // 6. Sync peer-ports for all clients that support it
       if (VPN_PORT_FORWARDING_ENABLED && forwardedPort !== null) {
-        await syncPeerPort(forwardedPort);
+        for (const client of clients) {
+          await syncPeerPort(client, forwardedPort);
+        }
       }
       return true;
     }
   }
 
+  const stillDown = clients.filter((c) => !clientsUp.has(c.containerName));
   log(
     "ERROR",
-    `Transmission did not come back after ${RESTART_MAX_ATTEMPTS} attempts`,
+    `These clients did not come back after ${RESTART_MAX_ATTEMPTS} attempts: ${stillDown.map((c) => c.clientName).join(", ")}`,
   );
   return false;
 }
 
-// ─── TX-only restart (VPN healthy, TX process dead) ──────────────────────────
+// ─── Per-client restart ───────────────────────────────────────────────────────
 
-async function handleTxRestart(): Promise<boolean> {
-  logBanner("⟳  TX_RESTARTING", "Transmission process is unresponsive");
+/**
+ * Restarts one specific client container (VPN is healthy; the client process died).
+ * Returns true on success → RECOVERY; false → back to MONITORING after cooldown.
+ */
+async function handleClientRestart(client: TorrentClient): Promise<boolean> {
+  logBanner(
+    `⟳  CLIENT_RESTARTING`,
+    `${client.clientName} (${client.containerName}) is unresponsive`,
+  );
 
   log("INFO", "Checking local network connectivity...");
   const hasNetwork = await checkNetwork();
@@ -200,13 +250,13 @@ async function handleTxRestart(): Promise<boolean> {
     return false;
   }
 
-  // Wait for VPN connectivity before restarting Transmission
+  // Wait for VPN connectivity before restarting the client
   const maxWaitSec =
     (Number(process.env.VPN_CONNECT_TIMEOUT_ATTEMPTS ?? 60) *
       RESTART_POLL_INTERVAL_MS) /
     1000;
   let forwardedPort: number | null = null;
-  if (process.env.VPN_PORT_FORWARDING_ENABLED === "true") {
+  if (VPN_PORT_FORWARDING_ENABLED) {
     log(
       "INFO",
       `Waiting up to ${maxWaitSec}s for VPN tunnel and forwarded port...`,
@@ -238,9 +288,9 @@ async function handleTxRestart(): Promise<boolean> {
     log("OK", `VPN connected — external IP: ${externalIp ?? "unknown"}`);
   }
 
-  log("INFO", `Network OK — restarting container "${CONTAINER_NAME}"...`);
+  log("INFO", `Network OK — restarting container "${client.containerName}"...`);
   try {
-    await restartContainer(CONTAINER_NAME);
+    await restartContainer(client.containerName);
   } catch (err) {
     log("ERROR", `Failed to restart container: ${err}`);
     return false;
@@ -248,66 +298,85 @@ async function handleTxRestart(): Promise<boolean> {
 
   log(
     "INFO",
-    `Polling Transmission RPC (up to ${RESTART_MAX_ATTEMPTS} attempts)...`,
+    `Polling ${client.clientName} API (up to ${RESTART_MAX_ATTEMPTS} attempts)...`,
   );
   for (let attempt = 1; attempt <= RESTART_MAX_ATTEMPTS; attempt++) {
     await sleep(RESTART_POLL_INTERVAL_MS);
-    const containerState = await getContainerState(CONTAINER_NAME);
-    const healthy = await checkHealth();
+    const containerState = await getContainerState(client.containerName);
+    const healthy = await client.checkHealth();
     log(
       healthy ? "OK" : "INFO",
-      `[${attempt}/${RESTART_MAX_ATTEMPTS}] container: ${containerState ?? "unknown"} · RPC: ${healthy ? "UP" : "DOWN"}`,
+      `[${attempt}/${RESTART_MAX_ATTEMPTS}] container: ${containerState ?? "unknown"} · API: ${healthy ? "UP" : "DOWN"}`,
     );
     if (healthy) {
-      log("OK", "Transmission is back online");
+      log("OK", `${client.clientName} is back online`);
+      if (VPN_PORT_FORWARDING_ENABLED && forwardedPort !== null) {
+        await syncPeerPort(client, forwardedPort);
+      }
       return true;
     }
   }
 
   log(
     "ERROR",
-    `Transmission did not come back after ${RESTART_MAX_ATTEMPTS} attempts. Will retry next cycle.`,
+    `${client.clientName} did not come back after ${RESTART_MAX_ATTEMPTS} attempts. Will retry next cycle.`,
   );
   return false;
 }
 
 // ─── Peer-port sync helper ────────────────────────────────────────────────────
 
-async function syncPeerPort(forwardedPort: number): Promise<void> {
+async function syncPeerPort(
+  client: TorrentClient,
+  forwardedPort: number,
+): Promise<void> {
   try {
-    const currentPort = await getSessionPeerPort();
+    const currentPort = await client.getSessionPeerPort();
+    if (currentPort === null) return; // client does not support port management
     if (currentPort === forwardedPort) {
-      log("INFO", `Peer-port ${forwardedPort} already set — no change needed`);
+      log(
+        "INFO",
+        `${client.clientName} peer-port ${forwardedPort} already set — no change needed`,
+      );
       return;
     }
     log(
       "INFO",
-      `Syncing peer-port: ${currentPort ?? "unknown"} → ${forwardedPort}`,
+      `${client.clientName}: syncing peer-port ${currentPort} → ${forwardedPort}`,
     );
-    await setSessionPeerPort(forwardedPort);
-    log("OK", `Peer-port updated to ${forwardedPort}`);
+    await client.setSessionPeerPort(forwardedPort);
+    log("OK", `${client.clientName}: peer-port updated to ${forwardedPort}`);
   } catch (err) {
-    log("WARN", `Failed to sync peer-port: ${err}`);
+    log("WARN", `${client.clientName}: failed to sync peer-port: ${err}`);
   }
 }
 
 // ─── Recovery ─────────────────────────────────────────────────────────────────
 
-async function handleRecovery(): Promise<void> {
+async function handleRecovery(clients: TorrentClient[]): Promise<void> {
   logBanner(
     "↺  RECOVERY",
-    `Stopping all torrents, waiting ${RECOVERY_WAIT_MS / 1000}s, then resuming`,
+    `Stopping all torrents for ${clients.map((c) => c.clientName).join(", ")}, waiting ${RECOVERY_WAIT_MS / 1000}s, then resuming`,
   );
 
-  let ids: number[] = [];
-  try {
-    ids = await getAllTorrentIds();
-    log("INFO", `Found ${ids.length} torrent(s) — stopping all`);
-    await stopAllTorrents(ids);
-    log("OK", "All torrents stopped");
-  } catch (err) {
-    log("ERROR", `Failed to stop torrents: ${err} — skipping recovery wait`);
-    return;
+  // Stop torrents for each client; collect IDs for later resume
+  const idsByClient = new Map<string, (number | string)[]>();
+  for (const client of clients) {
+    try {
+      const ids = await client.getAllTorrentIds();
+      log(
+        "INFO",
+        `${client.clientName}: found ${ids.length} torrent(s) — stopping all`,
+      );
+      await client.stopAllTorrents(ids);
+      log("OK", `${client.clientName}: all torrents stopped`);
+      idsByClient.set(client.containerName, ids);
+    } catch (err) {
+      log(
+        "ERROR",
+        `${client.clientName}: failed to stop torrents: ${err} — skipping this client`,
+      );
+    }
   }
 
   log(
@@ -316,56 +385,81 @@ async function handleRecovery(): Promise<void> {
   );
   await sleep(RECOVERY_WAIT_MS);
 
-  try {
-    log("INFO", "Resuming all torrents...");
-    await startAllTorrents(ids);
-    log("OK", `${ids.length} torrent(s) resumed — returning to monitoring`);
-  } catch (err) {
-    log("ERROR", `Failed to resume torrents: ${err}`);
+  for (const client of clients) {
+    const ids = idsByClient.get(client.containerName);
+    if (ids === undefined) continue; // stop failed for this client earlier
+    try {
+      log("INFO", `${client.clientName}: resuming ${ids.length} torrent(s)...`);
+      await client.startAllTorrents(ids);
+      log(
+        "OK",
+        `${client.clientName}: ${ids.length} torrent(s) resumed — returning to monitoring`,
+      );
+    } catch (err) {
+      log("ERROR", `${client.clientName}: failed to resume torrents: ${err}`);
+    }
   }
 }
 
 // ─── Main loop ───────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  const clientSummary =
+    activeClients.length === 0
+      ? "no torrent clients (VPN-only mode)"
+      : activeClients
+          .map((c) => `${c.clientName} (${c.containerName})`)
+          .join(", ");
+
   logBanner(
     "▶  transmission-watchdog started",
-    `VPN: ${VPN_CONTAINER_NAME}  ·  TX: ${CONTAINER_NAME}  ·  interval: ${CHECK_INTERVAL_MS / 1000}s  ·  recovery wait: ${RECOVERY_WAIT_MS / 1000}s  ·  port forwarding: ${VPN_PORT_FORWARDING_ENABLED ? "enabled" : "disabled"}`,
+    `VPN: ${VPN_CONTAINER_NAME}  ·  Clients: ${clientSummary}  ·  interval: ${CHECK_INTERVAL_MS / 1000}s  ·  recovery wait: ${RECOVERY_WAIT_MS / 1000}s  ·  port forwarding: ${VPN_PORT_FORWARDING_ENABLED ? "enabled" : "disabled"}`,
   );
 
-  let state: State = "MONITORING";
-  // Counts consecutive external TX RPC failures; resets on any success or state transition
-  let txFailureCount = 0;
+  let state: State = { tag: "MONITORING" };
+  // Per-client consecutive external API failure counts; keyed by containerName
+  const failureCounts = new Map<string, number>();
 
-  while (true) {
+  outer: while (true) {
     // ── MONITORING ────────────────────────────────────────────────────────────
-    if (state === "MONITORING") {
+    if (state.tag === "MONITORING") {
       // Phase 1: Docker inspect — instant (~50 ms), print immediately
-      const [vpnRunning, txContainerState] = await Promise.all([
+      const [vpnRunning, ...clientContainerStates] = await Promise.all([
         checkVpnRunning(),
-        getContainerState(CONTAINER_NAME),
+        ...activeClients.map((c) => getContainerState(c.containerName)),
       ]);
-      const txContainerRunning = txContainerState === "running";
+
       log(
         vpnRunning ? "OK" : "WARN",
         `VPN  ${VPN_CONTAINER_NAME}: ${vpnRunning ? "running" : "NOT running"}`,
       );
-      log(
-        txContainerRunning ? "OK" : "WARN",
-        `TX   ${CONTAINER_NAME}: ${txContainerState ?? "not found"}`,
-      );
+
+      const clientRunning = new Map<string, boolean>();
+      for (const [i, client] of activeClients.entries()) {
+        const cs = clientContainerStates[i];
+        const running = cs === "running";
+        clientRunning.set(client.containerName, running);
+        log(
+          running ? "OK" : "WARN",
+          `${client.clientName.padEnd(4)} ${client.containerName}: ${cs ?? "not found"}`,
+        );
+      }
 
       // If VPN container is outright down, no point probing the network
       if (!vpnRunning) {
-        log("WARN", `VPN container is not running — initiating VPN restart`);
-        txFailureCount = 0;
-        state = "VPN_RESTARTING";
-        continue;
+        log("WARN", "VPN container is not running — initiating VPN restart");
+        failureCounts.clear();
+        state = { tag: "VPN_RESTARTING" };
+        continue outer;
       }
 
-      // Phase 2: slower checks — fire in parallel, print EACH result the moment it resolves
-      log("INFO", "Checking VPN tunnel and Transmission RPC...");
-      const checkPromises = [
+      // Phase 2: VPN network checks
+      log(
+        "INFO",
+        "Checking VPN tunnel" +
+          (activeClients.length > 0 ? " and client APIs..." : "..."),
+      );
+      const [vpnInternet, forwardedPort, vpnExternalIp] = await Promise.all([
         checkVpnInternet().then((ok) => {
           log(
             ok ? "OK" : "WARN",
@@ -385,161 +479,179 @@ async function main(): Promise<void> {
           else log("WARN", `VPN  external IP: unavailable`);
           return ip;
         }),
-        checkHealth().then((ok) => {
-          const retriesLeft = TX_HEALTH_RETRIES - txFailureCount - 1;
-          const retryHint =
-            !ok && txFailureCount > 0
-              ? ` — ${retriesLeft > 0 ? `${retriesLeft} retry attempt(s) left` : "no retries left, will check internally"}`
-              : "";
-          log(
-            ok ? "OK" : "WARN",
-            `TX   RPC: ${ok ? "responding" : `not responding${retryHint}`}`,
-          );
-          return ok;
-        }),
-        checkTrackerConnectivity().then((ok) => {
-          if (ok === true) log("OK", "TX   trackers: announcing successfully");
-          if (ok === false)
-            log(
-              "WARN",
-              "TX   trackers: all announces failing — network may be broken",
-            );
-          // ok === null means no data yet, print nothing
-          return ok;
-        }),
-        VPN_PORT_FORWARDING_ENABLED
-          ? getSessionPeerPort()
-          : Promise.resolve(null),
-      ] as const;
-      const [
-        vpnInternet,
-        forwardedPort,
-        vpnExternalIp,
-        txHealthy,
-        trackerOk,
-        txPeerPort,
-      ] = await Promise.all(checkPromises);
-      void vpnExternalIp; // used for display only above
+      ]);
+      void vpnExternalIp; // logged above
 
       // ── VPN no internet
       if (!vpnInternet) {
-        txFailureCount = 0;
-        state = "VPN_RESTARTING";
-        continue;
+        failureCounts.clear();
+        state = { tag: "VPN_RESTARTING" };
+        continue outer;
       }
 
-      // ── Port sync (non-disruptive, every cycle)
-      if (VPN_PORT_FORWARDING_ENABLED) {
-        if (forwardedPort !== null) {
-          await syncPeerPort(forwardedPort);
-        } else {
+      // ── Phase 3: Per-client API health + tracker check + peer port
+      if (activeClients.length > 0) {
+        const clientResults = await Promise.all(
+          activeClients.map(async (client) => {
+            const failureCount = failureCounts.get(client.containerName) ?? 0;
+            const retriesLeft = CLIENT_HEALTH_RETRIES - failureCount - 1;
+            const [healthy, trackerOk, peerPort] = await Promise.all([
+              client.checkHealth().then((ok) => {
+                const retryHint =
+                  !ok && failureCount > 0
+                    ? ` — ${retriesLeft > 0 ? `${retriesLeft} retry attempt(s) left` : "no retries left, will check internally"}`
+                    : "";
+                log(
+                  ok ? "OK" : "WARN",
+                  `${client.clientName.padEnd(4)} API: ${ok ? "responding" : `not responding${retryHint}`}`,
+                );
+                return ok;
+              }),
+              client.checkTrackerConnectivity().then((ok) => {
+                if (ok === true)
+                  log(
+                    "OK",
+                    `${client.clientName.padEnd(4)} trackers: announcing successfully`,
+                  );
+                if (ok === false)
+                  log(
+                    "WARN",
+                    `${client.clientName.padEnd(4)} trackers: all announces failing — network may be broken`,
+                  );
+                return ok;
+              }),
+              VPN_PORT_FORWARDING_ENABLED
+                ? client.getSessionPeerPort()
+                : Promise.resolve(null),
+            ]);
+            void peerPort; // used only by syncPeerPort below
+            return { client, healthy, trackerOk };
+          }),
+        );
+
+        // ── Port sync (non-disruptive, every cycle)
+        if (VPN_PORT_FORWARDING_ENABLED) {
+          if (forwardedPort !== null) {
+            for (const { client } of clientResults) {
+              await syncPeerPort(client, forwardedPort);
+            }
+          } else {
+            log(
+              "WARN",
+              "Forwarded port unavailable — VPN may still be establishing tunnel",
+            );
+          }
+        }
+
+        // ── Evaluate each client's health
+        for (const { client, healthy, trackerOk } of clientResults) {
+          if (healthy) {
+            // Tracker check: if all trackers are failing despite API being alive,
+            // the VPN tunnel is broken for real traffic even though ping passes.
+            if (trackerOk === false) {
+              log(
+                "WARN",
+                `${client.clientName} API is up but all trackers are failing — VPN tunnel likely broken, initiating VPN restart`,
+              );
+              failureCounts.clear();
+              state = { tag: "VPN_RESTARTING" };
+              continue outer;
+            }
+            failureCounts.set(client.containerName, 0);
+            continue; // this client is healthy
+          }
+
+          // ── Client container not running — no point retrying
+          if (!clientRunning.get(client.containerName)) {
+            log(
+              "WARN",
+              `${client.clientName} container "${client.containerName}" is not running — skipping retries, restarting now`,
+            );
+            failureCounts.set(client.containerName, 0);
+            state = { tag: "CLIENT_RESTARTING", client };
+            continue outer;
+          }
+
+          // ── Client unhealthy — retry before escalating
+          const prevCount = failureCounts.get(client.containerName) ?? 0;
+          const newCount = prevCount + 1;
+          failureCounts.set(client.containerName, newCount);
+
+          if (newCount < CLIENT_HEALTH_RETRIES) {
+            const retriesLeft = CLIENT_HEALTH_RETRIES - newCount;
+            log(
+              "INFO",
+              `${client.clientName}: will retry in ${CLIENT_HEALTH_RETRY_INTERVAL_MS / 1000}s · ${retriesLeft} attempt(s) remaining before internal check`,
+            );
+            await sleep(CLIENT_HEALTH_RETRY_INTERVAL_MS);
+            continue outer;
+          }
+
+          // ── Retry limit reached — exec internal check
+          log(
+            "INFO",
+            `${client.clientName}: checking internally from inside the VPN container...`,
+          );
+          const internallyHealthy = await client.checkInternalHealth();
+          if (internallyHealthy) {
+            log(
+              "WARN",
+              `${client.clientName} responds internally but not externally — busy (e.g. file move), standing down restart`,
+            );
+            failureCounts.set(client.containerName, 0);
+            await sleep(CHECK_INTERVAL_MS);
+            continue outer;
+          }
+
           log(
             "WARN",
-            "Forwarded port unavailable — VPN may still be establishing tunnel",
+            `${client.clientName} unresponsive both externally and internally — process is dead`,
           );
+          failureCounts.set(client.containerName, 0);
+          state = { tag: "CLIENT_RESTARTING", client };
+          continue outer;
         }
       }
 
-      // ── TX healthy — but also verify tracker connectivity
-      if (txHealthy) {
-        // Tracker check: if all trackers are failing despite TX being alive, the
-        // VPN tunnel is broken for real traffic even though ping passes.
-        if (trackerOk === false) {
-          log(
-            "WARN",
-            "TX RPC is up but all trackers are failing — VPN tunnel likely broken, initiating VPN restart",
-          );
-          txFailureCount = 0;
-          state = "VPN_RESTARTING";
-          continue;
-        }
-        txFailureCount = 0;
-        log(
-          "OK",
-          `All services healthy — next check in ${CHECK_INTERVAL_MS / 1000}s`,
-        );
-        await sleep(CHECK_INTERVAL_MS);
-        continue;
-      }
-
-      // ── TX container not running — no point retrying, restart immediately
-      if (!txContainerRunning) {
-        log(
-          "WARN",
-          `TX container "${CONTAINER_NAME}" is not running (state: ${txContainerState ?? "not found"}) — skipping retries, restarting now`,
-        );
-        txFailureCount = 0;
-        state = "TX_RESTARTING";
-        continue;
-      }
-
-      // ── TX unhealthy — retry before escalating
-      txFailureCount++;
-      if (txFailureCount < TX_HEALTH_RETRIES) {
-        const retriesLeft = TX_HEALTH_RETRIES - txFailureCount;
-        log(
-          "INFO",
-          `Will retry in ${TX_HEALTH_RETRY_INTERVAL_MS / 1000}s · ${retriesLeft} attempt(s) remaining before internal check`,
-        );
-        await sleep(TX_HEALTH_RETRY_INTERVAL_MS);
-        continue;
-      }
-
-      // ── Retry limit reached — exec internal check to rule out file-move busy state
       log(
-        "INFO",
-        "Checking Transmission internally from inside the VPN container...",
+        "OK",
+        `All services healthy — next check in ${CHECK_INTERVAL_MS / 1000}s`,
       );
-      const internallyHealthy = await checkTransmissionInternalHealth();
-      if (internallyHealthy) {
-        log(
-          "WARN",
-          "TX responds internally but not externally — busy with a file move, standing down restart",
-        );
-        txFailureCount = 0;
-        await sleep(CHECK_INTERVAL_MS);
-        continue;
-      }
+      await sleep(CHECK_INTERVAL_MS);
 
-      log(
-        "WARN",
-        "TX unresponsive both externally and internally — process is dead",
-      );
-      txFailureCount = 0;
-      state = "TX_RESTARTING";
-
-      // ── TX_RESTARTING ─────────────────────────────────────────────────────────
-    } else if (state === "TX_RESTARTING") {
-      const recovered = await handleTxRestart();
+      // ── CLIENT_RESTARTING ─────────────────────────────────────────────────────
+    } else if (state.tag === "CLIENT_RESTARTING") {
+      const client: TorrentClient = state.client;
+      const recovered = await handleClientRestart(client);
       if (recovered) {
-        state = "RECOVERY";
+        state = { tag: "RECOVERY", clients: [client] };
       } else {
         log(
           "INFO",
           `Waiting ${CHECK_INTERVAL_MS / 1000}s before next restart attempt...`,
         );
         await sleep(CHECK_INTERVAL_MS);
-        state = "MONITORING";
+        state = { tag: "MONITORING" };
       }
 
       // ── VPN_RESTARTING ────────────────────────────────────────────────────────
-    } else if (state === "VPN_RESTARTING") {
-      const recovered = await handleVpnRestart();
+    } else if (state.tag === "VPN_RESTARTING") {
+      const recovered = await handleVpnRestart(activeClients);
       if (recovered) {
-        state = "RECOVERY";
+        state = { tag: "RECOVERY", clients: activeClients };
       } else {
         log(
           "INFO",
           `VPN restart failed or timed out — waiting ${CHECK_INTERVAL_MS / 1000}s before retrying`,
         );
         await sleep(CHECK_INTERVAL_MS);
-        state = "MONITORING";
+        state = { tag: "MONITORING" };
       }
 
       // ── RECOVERY ──────────────────────────────────────────────────────────────
-    } else if (state === "RECOVERY") {
-      await handleRecovery();
-      state = "MONITORING";
+    } else if (state.tag === "RECOVERY") {
+      await handleRecovery(state.clients);
+      state = { tag: "MONITORING" };
       // No extra sleep — recovery itself took ~10 min
     }
   }

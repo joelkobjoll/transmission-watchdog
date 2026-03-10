@@ -1,7 +1,16 @@
+import { execInContainer } from "./docker";
+import type { TorrentClient } from "./torrent-client";
+
 const UNRAID_IP = process.env.UNRAID_IP ?? "192.168.1.100";
 const TRANSMISSION_PORT = process.env.TRANSMISSION_PORT ?? "9091";
 const RPC_URL = `http://${UNRAID_IP}:${TRANSMISSION_PORT}/transmission/rpc`;
 const RPC_TIMEOUT_MS = 10_000;
+
+export const TRANSMISSION_CONTAINER_NAME =
+  process.env.CONTAINER_NAME ?? "transmission-vpn";
+
+// The VPN container whose network namespace Transmission shares (for exec-based checks).
+const VPN_CONTAINER_NAME = process.env.VPN_CONTAINER_NAME ?? "wireguard-pia";
 
 // Transmission requires a session ID sent back via X-Transmission-Session-Id.
 // We obtain it by making a request and reading the header from the 409 response.
@@ -69,13 +78,15 @@ export async function getAllTorrentIds(): Promise<number[]> {
 }
 
 /** Stops (pauses) all torrents. */
-export async function stopAllTorrents(ids: number[]): Promise<void> {
+export async function stopAllTorrents(ids: (number | string)[]): Promise<void> {
   if (ids.length === 0) return;
   await fetchRpc({ method: "torrent-stop", arguments: { ids } });
 }
 
 /** Starts (resumes) all torrents. */
-export async function startAllTorrents(ids: number[]): Promise<void> {
+export async function startAllTorrents(
+  ids: (number | string)[],
+): Promise<void> {
   if (ids.length === 0) return;
   await fetchRpc({ method: "torrent-start", arguments: { ids } });
 }
@@ -112,6 +123,25 @@ export async function setSessionPeerPort(port: number): Promise<void> {
  *   - Returns `null`  if there are no torrents or no announce history yet
  *                    (e.g. all torrents newly added — not enough data to judge).
  */
+/**
+ * Checks if Transmission's RPC endpoint is reachable from *inside* the VPN
+ * container (which shares the network namespace with the transmission container).
+ * Exit codes 0 and 8 (HTTP 409 from Transmission) both mean the process is alive.
+ */
+export async function checkInternalHealth(): Promise<boolean> {
+  try {
+    const result = await execInContainer(VPN_CONTAINER_NAME, [
+      "wget",
+      "-qO-",
+      "--timeout=5",
+      `http://localhost:${TRANSMISSION_PORT}/transmission/rpc`,
+    ]);
+    return result.exitCode === 0 || result.exitCode === 8;
+  } catch {
+    return false;
+  }
+}
+
 export async function checkTrackerConnectivity(): Promise<boolean | null> {
   try {
     const args = (await fetchRpc({
@@ -145,3 +175,18 @@ export async function checkTrackerConnectivity(): Promise<boolean | null> {
     return null;
   }
 }
+
+// ─── Client object ───────────────────────────────────────────────────────────
+
+export const transmissionClient: TorrentClient = {
+  clientName: "Transmission",
+  containerName: TRANSMISSION_CONTAINER_NAME,
+  checkHealth,
+  getAllTorrentIds,
+  stopAllTorrents,
+  startAllTorrents,
+  checkTrackerConnectivity,
+  getSessionPeerPort,
+  setSessionPeerPort,
+  checkInternalHealth,
+};
