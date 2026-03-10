@@ -42,6 +42,8 @@ const TX_HEALTH_RETRY_INTERVAL_MS = Number(
 );
 // How long to wait for TX container to stop before proceeding anyway
 const TX_STOP_MAX_ATTEMPTS = 12;
+const VPN_PORT_FORWARDING_ENABLED =
+  (process.env.VPN_PORT_FORWARDING_ENABLED ?? "true").toLowerCase() === "true";
 
 // ─── Sleep helper ─────────────────────────────────────────────────────────────
 
@@ -103,28 +105,34 @@ async function handleVpnRestart(): Promise<boolean> {
     return false;
   }
 
-  // 3. Wait for VPN tunnel + forwarded port
+  // 3. Wait for VPN tunnel (+ forwarded port if enabled)
   const maxWaitSec =
     (Number(process.env.VPN_CONNECT_TIMEOUT_ATTEMPTS ?? 60) *
       RESTART_POLL_INTERVAL_MS) /
     1000;
   log(
     "INFO",
-    `Waiting up to ${maxWaitSec}s for VPN tunnel and forwarded port...`,
+    VPN_PORT_FORWARDING_ENABLED
+      ? `Waiting up to ${maxWaitSec}s for VPN tunnel and forwarded port...`
+      : `Waiting up to ${maxWaitSec}s for VPN tunnel (port forwarding disabled)...`,
   );
   const forwardedPort = await waitForVpnConnected();
-  if (forwardedPort === null) {
+  if (VPN_PORT_FORWARDING_ENABLED && forwardedPort === null) {
     log(
       "ERROR",
       "VPN did not establish connectivity and forwarded port within timeout",
     );
     return false;
   }
-  const externalIp = await getVpnExternalIp();
-  log(
-    "OK",
-    `VPN connected — external IP: ${externalIp ?? "unknown"} · forwarded port: ${forwardedPort}`,
-  );
+  if (!VPN_PORT_FORWARDING_ENABLED) {
+    log("OK", "VPN connected (port forwarding disabled)");
+  } else {
+    const externalIp = await getVpnExternalIp();
+    log(
+      "OK",
+      `VPN connected — external IP: ${externalIp ?? "unknown"} · forwarded port: ${forwardedPort}`,
+    );
+  }
 
   // 4. Start TX container
   log("INFO", `Starting ${CONTAINER_NAME}...`);
@@ -270,7 +278,7 @@ async function handleRecovery(): Promise<void> {
 async function main(): Promise<void> {
   logBanner(
     "▶  transmission-watchdog started",
-    `VPN: ${VPN_CONTAINER_NAME}  ·  TX: ${CONTAINER_NAME}  ·  interval: ${CHECK_INTERVAL_MS / 1000}s  ·  recovery wait: ${RECOVERY_WAIT_MS / 1000}s`,
+    `VPN: ${VPN_CONTAINER_NAME}  ·  TX: ${CONTAINER_NAME}  ·  interval: ${CHECK_INTERVAL_MS / 1000}s  ·  recovery wait: ${RECOVERY_WAIT_MS / 1000}s  ·  port forwarding: ${VPN_PORT_FORWARDING_ENABLED ? "enabled" : "disabled"}`,
   );
 
   let state: State = "MONITORING";
@@ -315,8 +323,12 @@ async function main(): Promise<void> {
             return ok;
           }),
           getForwardedPort().then((port) => {
-            if (port !== null) log("OK", `VPN  forwarded port: ${port}`);
-            else log("WARN", `VPN  forwarded port: unavailable`);
+            if (VPN_PORT_FORWARDING_ENABLED) {
+              if (port !== null) log("OK", `VPN  forwarded port: ${port}`);
+              else log("WARN", `VPN  forwarded port: unavailable`);
+            } else {
+              log("INFO", "VPN  forwarded port: (port forwarding disabled)");
+            }
             return port;
           }),
           getVpnExternalIp().then((ip) => {
@@ -348,13 +360,15 @@ async function main(): Promise<void> {
       }
 
       // ── Port sync (non-disruptive, every cycle)
-      if (forwardedPort !== null) {
-        await syncPeerPort(forwardedPort);
-      } else {
-        log(
-          "WARN",
-          "Forwarded port unavailable — VPN may still be establishing tunnel",
-        );
+      if (VPN_PORT_FORWARDING_ENABLED) {
+        if (forwardedPort !== null) {
+          await syncPeerPort(forwardedPort);
+        } else {
+          log(
+            "WARN",
+            "Forwarded port unavailable — VPN may still be establishing tunnel",
+          );
+        }
       }
 
       // ── TX healthy
