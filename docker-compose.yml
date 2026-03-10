@@ -4,30 +4,5 @@ services:
     image: transmission-watchdog
     container_name: transmission-watchdog
     restart: unless-stopped
-    environment:
-      # ── Unraid server ────────────────────────────────────────────────────────
-      UNRAID_IP: ${UNRAID_IP:-192.168.1.100}
-      DOCKER_PORT: ${DOCKER_PORT:-2375}
-
-      # ── Container names ──────────────────────────────────────────────────────
-      CONTAINER_NAME: ${CONTAINER_NAME:-transmission-vpn}
-      VPN_CONTAINER_NAME: ${VPN_CONTAINER_NAME:-wireguard-pia}
-
-      # ── Transmission RPC ─────────────────────────────────────────────────────
-      TRANSMISSION_PORT: ${TRANSMISSION_PORT:-9091}
-
-      # ── VPN port forwarding ──────────────────────────────────────────────────
-      VPN_PORT_FILE_PATH: ${VPN_PORT_FILE_PATH:-/pia-shared/port.dat}
-      VPN_CONNECT_TIMEOUT_ATTEMPTS: ${VPN_CONNECT_TIMEOUT_ATTEMPTS:-60}
-
-      # ── Health check tuning ──────────────────────────────────────────────────
-      CHECK_INTERVAL_MS: ${CHECK_INTERVAL_MS:-300000}
-      RECOVERY_WAIT_MS: ${RECOVERY_WAIT_MS:-600000}
-      RESTART_POLL_INTERVAL_MS: ${RESTART_POLL_INTERVAL_MS:-10000}
-      RESTART_MAX_ATTEMPTS: ${RESTART_MAX_ATTEMPTS:-30}
-      TX_HEALTH_RETRIES: ${TX_HEALTH_RETRIES:-3}
-      TX_HEALTH_RETRY_INTERVAL_MS: ${TX_HEALTH_RETRY_INTERVAL_MS:-120000}
-      EXEC_TIMEOUT_MS: ${EXEC_TIMEOUT_MS:-30000}
-
-      # ── Network probe ────────────────────────────────────────────────────────
-      NETWORK_CHECK_URL: ${NETWORK_CHECK_URL:-http://1.1.1.1}
+    env_file:
+      - .env
