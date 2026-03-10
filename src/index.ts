@@ -13,6 +13,7 @@ import {
   startAllTorrents,
   getSessionPeerPort,
   setSessionPeerPort,
+  checkTrackerConnectivity,
 } from "./transmission";
 import {
   VPN_CONTAINER_NAME,
@@ -358,12 +359,28 @@ async function main(): Promise<void> {
           );
           return ok;
         }),
+        checkTrackerConnectivity().then((ok) => {
+          if (ok === true) log("OK", "TX   trackers: announcing successfully");
+          if (ok === false)
+            log(
+              "WARN",
+              "TX   trackers: all announces failing — network may be broken",
+            );
+          // ok === null means no data yet, print nothing
+          return ok;
+        }),
         VPN_PORT_FORWARDING_ENABLED
           ? getSessionPeerPort()
           : Promise.resolve(null),
       ] as const;
-      const [vpnInternet, forwardedPort, vpnExternalIp, txHealthy, txPeerPort] =
-        await Promise.all(checkPromises);
+      const [
+        vpnInternet,
+        forwardedPort,
+        vpnExternalIp,
+        txHealthy,
+        trackerOk,
+        txPeerPort,
+      ] = await Promise.all(checkPromises);
       void vpnExternalIp; // used for display only above
 
       // ── VPN no internet
@@ -385,8 +402,19 @@ async function main(): Promise<void> {
         }
       }
 
-      // ── TX healthy
+      // ── TX healthy — but also verify tracker connectivity
       if (txHealthy) {
+        // Tracker check: if all trackers are failing despite TX being alive, the
+        // VPN tunnel is broken for real traffic even though ping passes.
+        if (trackerOk === false) {
+          log(
+            "WARN",
+            "TX RPC is up but all trackers are failing — VPN tunnel likely broken, initiating VPN restart",
+          );
+          txFailureCount = 0;
+          state = "VPN_RESTARTING";
+          continue;
+        }
         txFailureCount = 0;
         log(
           "OK",

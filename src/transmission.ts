@@ -100,3 +100,48 @@ export async function setSessionPeerPort(port: number): Promise<void> {
     arguments: { "peer-port": port },
   });
 }
+
+/**
+ * Checks whether Transmission is successfully announcing to trackers.
+ *
+ * Queries `trackerStats` for all torrents and inspects the last announce
+ * result for each tracker:
+ *   - Returns `true`  if at least one tracker has announced successfully.
+ *   - Returns `false` if every tracker with announce history shows failures
+ *                    (indicates network is up but tracker connectivity is broken).
+ *   - Returns `null`  if there are no torrents or no announce history yet
+ *                    (e.g. all torrents newly added — not enough data to judge).
+ */
+export async function checkTrackerConnectivity(): Promise<boolean | null> {
+  try {
+    const args = (await fetchRpc({
+      method: "torrent-get",
+      arguments: { fields: ["trackerStats"] },
+    })) as {
+      torrents: Array<{
+        trackerStats: Array<{
+          lastAnnounceSucceeded: boolean;
+          lastAnnounceTime: number;
+        }>;
+      }>;
+    };
+
+    if (args.torrents.length === 0) return null;
+
+    let hasHistory = false;
+    let anySuccess = false;
+    for (const torrent of args.torrents) {
+      for (const t of torrent.trackerStats) {
+        if (t.lastAnnounceTime > 0) {
+          hasHistory = true;
+          if (t.lastAnnounceSucceeded) anySuccess = true;
+        }
+      }
+    }
+
+    if (!hasHistory) return null;
+    return anySuccess;
+  } catch {
+    return null;
+  }
+}

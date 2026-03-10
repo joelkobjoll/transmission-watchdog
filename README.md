@@ -42,9 +42,9 @@ RECOVERY (after any restart)
 
 - [Bun](https://bun.sh) ≥ 1.0 (or Docker, see below)
 - Unraid with Docker TCP API enabled (`Settings → Docker → Enable TCP`)
-- `wireguard-pia` container with PIA port forwarding (`/pia-shared/port.dat`)
-- `transmission-vpn` using `--network container:wireguard-pia`
-- `wget` available inside the `wireguard-pia` container (standard in Alpine images)
+- A VPN container (`wireguard-pia`, `gluetun`, or any Alpine-based image) with `wget` available
+- `transmission-vpn` using `--network container:<vpn-container>`
+- _(Optional)_ Port forwarding support if `VPN_PORT_FORWARDING_ENABLED=true` (requires a `port.dat`-style file written by the VPN container)
 
 ---
 
@@ -93,23 +93,27 @@ docker compose up -d
 
 All settings are environment variables. Defaults are shown.
 
-| Variable                       | Default                | Description                                                   |
-| ------------------------------ | ---------------------- | ------------------------------------------------------------- |
-| `UNRAID_IP`                    | `192.168.1.100`        | IP address of the Unraid server                               |
-| `DOCKER_PORT`                  | `2375`                 | Docker TCP API port on Unraid                                 |
-| `CONTAINER_NAME`               | `transmission-vpn`     | Transmission container name                                   |
-| `VPN_CONTAINER_NAME`           | `wireguard-pia`        | VPN container name                                            |
-| `TRANSMISSION_PORT`            | `9091`                 | Transmission RPC port                                         |
-| `VPN_PORT_FILE_PATH`           | `/pia-shared/port.dat` | Forwarded port file path **inside** the VPN container         |
-| `VPN_CONNECT_TIMEOUT_ATTEMPTS` | `60`                   | Max polls for VPN to reconnect (× `RESTART_POLL_INTERVAL_MS`) |
-| `CHECK_INTERVAL_MS`            | `300000`               | Health check frequency — 5 min                                |
-| `RECOVERY_WAIT_MS`             | `600000`               | Wait after restart before resuming torrents — 10 min          |
-| `RESTART_POLL_INTERVAL_MS`     | `10000`                | Poll interval while waiting for containers — 10 s             |
-| `RESTART_MAX_ATTEMPTS`         | `30`                   | Max polls for TX RPC to come back (~5 min)                    |
-| `TX_HEALTH_RETRIES`            | `3`                    | Consecutive external RPC failures before escalating           |
-| `TX_HEALTH_RETRY_INTERVAL_MS`  | `120000`               | Wait between TX health retries — 2 min                        |
-| `EXEC_TIMEOUT_MS`              | `30000`                | Timeout for Docker exec operations — 30 s                     |
-| `NETWORK_CHECK_URL`            | `http://1.1.1.1`       | URL used to verify local internet connectivity                |
+| Variable                       | Default                | Description                                                                                                  |
+| ------------------------------ | ---------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `UNRAID_IP`                    | `192.168.1.100`        | IP address of the Unraid server                                                                              |
+| `DOCKER_PORT`                  | `2375`                 | Docker TCP API port on Unraid                                                                                |
+| `CONTAINER_NAME`               | `transmission-vpn`     | Transmission container name                                                                                  |
+| `VPN_CONTAINER_NAME`           | `wireguard-pia`        | VPN container name                                                                                           |
+| `TRANSMISSION_PORT`            | `9091`                 | Transmission RPC port                                                                                        |
+| `VPN_PORT_FILE_PATH`           | `/pia-shared/port.dat` | Forwarded port file path **inside** the VPN container                                                        |
+| `VPN_CONNECT_TIMEOUT_ATTEMPTS` | `60`                   | Max polls for VPN to reconnect (× `RESTART_POLL_INTERVAL_MS`)                                                |
+| `CHECK_INTERVAL_MS`            | `300000`               | Health check frequency — 5 min                                                                               |
+| `RECOVERY_WAIT_MS`             | `600000`               | Wait after restart before resuming torrents — 10 min                                                         |
+| `RESTART_POLL_INTERVAL_MS`     | `10000`                | Poll interval while waiting for containers — 10 s                                                            |
+| `RESTART_MAX_ATTEMPTS`         | `30`                   | Max polls for TX RPC to come back (~5 min)                                                                   |
+| `TX_HEALTH_RETRIES`            | `3`                    | Consecutive external RPC failures before escalating                                                          |
+| `TX_HEALTH_RETRY_INTERVAL_MS`  | `120000`               | Wait between TX health retries — 2 min                                                                       |
+| `EXEC_TIMEOUT_MS`              | `30000`                | Timeout for Docker exec operations — 30 s                                                                    |
+| `NETWORK_CHECK_URL`            | `http://1.1.1.1`       | URL used to verify local internet connectivity                                                               |
+| `VPN_PORT_FORWARDING_ENABLED`  | `true`                 | Set to `false` to skip port forwarding entirely — use with gluetun or any VPN that doesn't write a port file |
+| `VPN_PORT_FILE_PATH`           | `/pia-shared/port.dat` | Path to the forwarded port file **inside** the VPN container (only read when port forwarding is enabled)     |
+
+> **Using gluetun or another VPN without port forwarding?** Set `VPN_PORT_FORWARDING_ENABLED=false`. The watchdog will monitor VPN internet connectivity and restart containers on failure, without reading any port file or syncing the peer-port.
 
 ---
 
@@ -120,7 +124,7 @@ The watchdog streams colour-coded status lines to stdout as each check resolves:
 ```
 ────────────────────────────────────────────────────────────────────
   ▶  transmission-watchdog started
-  VPN: wireguard-pia  ·  TX: transmission-vpn  ·  interval: 300s
+  VPN: wireguard-pia  ·  TX: transmission-vpn  ·  interval: 300s  ·  port forwarding: enabled
 ────────────────────────────────────────────────────────────────────
 [Mar 10 11:51:13]    OK  ✓  VPN  wireguard-pia: running
 [Mar 10 11:51:13]    OK  ✓  TX   transmission-vpn: running
