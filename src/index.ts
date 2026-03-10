@@ -21,6 +21,7 @@ import {
   getVpnExternalIp,
   getForwardedPort,
   waitForVpnConnected,
+  waitForVpnInternet,
   checkTransmissionInternalHealth,
 } from "./vpn";
 import { log, logBanner } from "./logger";
@@ -110,28 +111,38 @@ async function handleVpnRestart(): Promise<boolean> {
     (Number(process.env.VPN_CONNECT_TIMEOUT_ATTEMPTS ?? 60) *
       RESTART_POLL_INTERVAL_MS) /
     1000;
-  log(
-    "INFO",
-    VPN_PORT_FORWARDING_ENABLED
-      ? `Waiting up to ${maxWaitSec}s for VPN tunnel and forwarded port...`
-      : `Waiting up to ${maxWaitSec}s for VPN tunnel (port forwarding disabled)...`,
-  );
-  const forwardedPort = await waitForVpnConnected();
-  if (VPN_PORT_FORWARDING_ENABLED && forwardedPort === null) {
+
+  let forwardedPort: number | null = null;
+  if (VPN_PORT_FORWARDING_ENABLED) {
     log(
-      "ERROR",
-      "VPN did not establish connectivity and forwarded port within timeout",
+      "INFO",
+      `Waiting up to ${maxWaitSec}s for VPN tunnel and forwarded port...`,
     );
-    return false;
-  }
-  if (!VPN_PORT_FORWARDING_ENABLED) {
-    log("OK", "VPN connected (port forwarding disabled)");
-  } else {
+    forwardedPort = await waitForVpnConnected();
+    if (forwardedPort === null) {
+      log(
+        "ERROR",
+        "VPN did not establish connectivity and forwarded port within timeout",
+      );
+      return false;
+    }
     const externalIp = await getVpnExternalIp();
     log(
       "OK",
       `VPN connected — external IP: ${externalIp ?? "unknown"} · forwarded port: ${forwardedPort}`,
     );
+  } else {
+    log("INFO", `Waiting up to ${maxWaitSec}s for VPN tunnel...`);
+    const vpnOk = await waitForVpnInternet();
+    if (!vpnOk) {
+      log(
+        "ERROR",
+        "VPN did not establish internet connectivity within timeout",
+      );
+      return false;
+    }
+    const externalIp = await getVpnExternalIp();
+    log("OK", `VPN connected — external IP: ${externalIp ?? "unknown"}`);
   }
 
   // 4. Start TX container
@@ -158,8 +169,10 @@ async function handleVpnRestart(): Promise<boolean> {
     );
     if (healthy) {
       log("OK", "Transmission RPC is back online");
-      // 6. Sync peer-port
-      await syncPeerPort(forwardedPort);
+      // 6. Sync peer-port (only if port forwarding is enabled)
+      if (VPN_PORT_FORWARDING_ENABLED && forwardedPort !== null) {
+        await syncPeerPort(forwardedPort);
+      }
       return true;
     }
   }
@@ -313,43 +326,44 @@ async function main(): Promise<void> {
 
       // Phase 2: slower checks — fire in parallel, print EACH result the moment it resolves
       log("INFO", "Checking VPN tunnel and Transmission RPC...");
-      const [vpnInternet, forwardedPort, vpnExternalIp, txHealthy, txPeerPort] =
-        await Promise.all([
-          checkVpnInternet().then((ok) => {
-            log(
-              ok ? "OK" : "WARN",
-              `VPN  internet: ${ok ? "connected" : "no connectivity"}`,
-            );
-            return ok;
-          }),
-          getForwardedPort().then((port) => {
-            if (VPN_PORT_FORWARDING_ENABLED) {
+      const checkPromises = [
+        checkVpnInternet().then((ok) => {
+          log(
+            ok ? "OK" : "WARN",
+            `VPN  internet: ${ok ? "connected" : "no connectivity"}`,
+          );
+          return ok;
+        }),
+        VPN_PORT_FORWARDING_ENABLED
+          ? getForwardedPort().then((port) => {
               if (port !== null) log("OK", `VPN  forwarded port: ${port}`);
               else log("WARN", `VPN  forwarded port: unavailable`);
-            } else {
-              log("INFO", "VPN  forwarded port: (port forwarding disabled)");
-            }
-            return port;
-          }),
-          getVpnExternalIp().then((ip) => {
-            if (ip !== null) log("OK", `VPN  external IP: ${ip}`);
-            else log("WARN", `VPN  external IP: unavailable`);
-            return ip;
-          }),
-          checkHealth().then((ok) => {
-            const retriesLeft = TX_HEALTH_RETRIES - txFailureCount - 1;
-            const retryHint =
-              !ok && txFailureCount > 0
-                ? ` — ${retriesLeft > 0 ? `${retriesLeft} retry attempt(s) left` : "no retries left, will check internally"}`
-                : "";
-            log(
-              ok ? "OK" : "WARN",
-              `TX   RPC: ${ok ? "responding" : `not responding${retryHint}`}`,
-            );
-            return ok;
-          }),
-          getSessionPeerPort(),
-        ]);
+              return port;
+            })
+          : Promise.resolve(null),
+        getVpnExternalIp().then((ip) => {
+          if (ip !== null) log("OK", `VPN  external IP: ${ip}`);
+          else log("WARN", `VPN  external IP: unavailable`);
+          return ip;
+        }),
+        checkHealth().then((ok) => {
+          const retriesLeft = TX_HEALTH_RETRIES - txFailureCount - 1;
+          const retryHint =
+            !ok && txFailureCount > 0
+              ? ` — ${retriesLeft > 0 ? `${retriesLeft} retry attempt(s) left` : "no retries left, will check internally"}`
+              : "";
+          log(
+            ok ? "OK" : "WARN",
+            `TX   RPC: ${ok ? "responding" : `not responding${retryHint}`}`,
+          );
+          return ok;
+        }),
+        VPN_PORT_FORWARDING_ENABLED
+          ? getSessionPeerPort()
+          : Promise.resolve(null),
+      ] as const;
+      const [vpnInternet, forwardedPort, vpnExternalIp, txHealthy, txPeerPort] =
+        await Promise.all(checkPromises);
       void vpnExternalIp; // used for display only above
 
       // ── VPN no internet

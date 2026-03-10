@@ -79,23 +79,28 @@ export async function getForwardedPort(): Promise<number | null> {
 }
 
 /**
+ * Polls until the VPN container has internet connectivity.
+ * Returns true on success, false on timeout.
+ */
+export async function waitForVpnInternet(
+  maxAttempts: number = VPN_CONNECT_TIMEOUT_ATTEMPTS,
+  intervalMs: number = 10_000,
+): Promise<boolean> {
+  for (let i = 1; i <= maxAttempts; i++) {
+    await sleep(intervalMs);
+    if (await checkVpnInternet()) return true;
+  }
+  return false;
+}
+
+/**
  * Polls until the VPN container has both internet connectivity AND a valid
  * forwarded port.  Returns the forwarded port on success, or null on timeout.
- * If VPN_PORT_FORWARDING_ENABLED is false, only waits for internet connectivity and returns null.
  */
 export async function waitForVpnConnected(
   maxAttempts: number = VPN_CONNECT_TIMEOUT_ATTEMPTS,
   intervalMs: number = 10_000,
 ): Promise<number | null> {
-  if (!VPN_PORT_FORWARDING_ENABLED) {
-    // Only wait for internet connectivity, skip port check
-    for (let i = 1; i <= maxAttempts; i++) {
-      await sleep(intervalMs);
-      const hasInternet = await checkVpnInternet();
-      if (hasInternet) return null;
-    }
-    return null;
-  }
   for (let i = 1; i <= maxAttempts; i++) {
     await sleep(intervalMs);
     const [hasInternet, port] = await Promise.all([
