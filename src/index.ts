@@ -200,6 +200,44 @@ async function handleTxRestart(): Promise<boolean> {
     return false;
   }
 
+  // Wait for VPN connectivity before restarting Transmission
+  const maxWaitSec =
+    (Number(process.env.VPN_CONNECT_TIMEOUT_ATTEMPTS ?? 60) *
+      RESTART_POLL_INTERVAL_MS) /
+    1000;
+  let forwardedPort: number | null = null;
+  if (process.env.VPN_PORT_FORWARDING_ENABLED === "true") {
+    log(
+      "INFO",
+      `Waiting up to ${maxWaitSec}s for VPN tunnel and forwarded port...`,
+    );
+    forwardedPort = await waitForVpnConnected();
+    if (forwardedPort === null) {
+      log(
+        "ERROR",
+        "VPN did not establish connectivity and forwarded port within timeout",
+      );
+      return false;
+    }
+    const externalIp = await getVpnExternalIp();
+    log(
+      "OK",
+      `VPN connected — external IP: ${externalIp ?? "unknown"} · forwarded port: ${forwardedPort}`,
+    );
+  } else {
+    log("INFO", `Waiting up to ${maxWaitSec}s for VPN tunnel...`);
+    const vpnOk = await waitForVpnInternet();
+    if (!vpnOk) {
+      log(
+        "ERROR",
+        "VPN did not establish internet connectivity within timeout",
+      );
+      return false;
+    }
+    const externalIp = await getVpnExternalIp();
+    log("OK", `VPN connected — external IP: ${externalIp ?? "unknown"}`);
+  }
+
   log("INFO", `Network OK — restarting container "${CONTAINER_NAME}"...`);
   try {
     await restartContainer(CONTAINER_NAME);
