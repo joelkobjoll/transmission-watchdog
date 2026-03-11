@@ -1,18 +1,13 @@
-import { execInContainer } from "./docker";
+import net from "node:net";
 import type { TorrentClient } from "./torrent-client";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-const UNRAID_IP = process.env.UNRAID_IP ?? "192.168.1.100";
-const RT_PORT = process.env.RTORRENT_PORT ?? "8080";
-const RT_RPC_PATH = process.env.RTORRENT_RPC_PATH ?? "/RPC2";
-const RT_BASE_URL = `http://${UNRAID_IP}:${RT_PORT}${RT_RPC_PATH}`;
+const RT_SOCKET_PATH =
+  process.env.RTORRENT_SOCKET_PATH ?? "/run/rtorrent/rpc.socket";
 
 export const RTORRENT_CONTAINER_NAME =
   process.env.RTORRENT_CONTAINER_NAME ?? "rtorrent";
-
-// The VPN container whose network namespace rTorrent shares (for exec-based checks).
-const VPN_CONTAINER_NAME = process.env.VPN_CONTAINER_NAME ?? "wireguard-pia";
 
 const API_TIMEOUT_MS = 10_000;
 
@@ -85,29 +80,62 @@ function isFault(xml: string): boolean {
   return xml.includes("<fault>");
 }
 
-/** Sends a single XML-RPC call and returns the raw response text. */
+/**
+ * Sends raw bytes over the rTorrent SCGI Unix socket and resolves with the
+ * response body (everything after the HTTP-like \r\n\r\n header separator).
+ */
+function scgiSend(requestBuf: Buffer): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const socket = net.createConnection({ path: RT_SOCKET_PATH });
+
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("rTorrent SCGI timeout"));
+    }, API_TIMEOUT_MS);
+
+    socket.on("connect", () => socket.write(requestBuf));
+    socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+    socket.on("end", () => {
+      clearTimeout(timer);
+      const raw = Buffer.concat(chunks).toString("utf8");
+      const sep = raw.indexOf("\r\n\r\n");
+      if (sep === -1) {
+        reject(new Error("rTorrent SCGI: malformed response"));
+        return;
+      }
+      resolve(raw.slice(sep + 4));
+    });
+    socket.on("error", (err: Error) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
+/** Sends a single XML-RPC call over SCGI and returns the raw response text. */
 async function rpc(
   method: string,
   params: Array<
     string | number | boolean | Array<Record<string, unknown>>
   > = [],
 ): Promise<string> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
-  try {
-    const res = await fetch(RT_BASE_URL, {
-      method: "POST",
-      signal: controller.signal,
-      headers: { "Content-Type": "text/xml" },
-      body: buildCall(method, params),
-    });
-    clearTimeout(timer);
-    if (!res.ok) throw new Error(`rTorrent RPC HTTP ${res.status}`);
-    return res.text();
-  } catch (err) {
-    clearTimeout(timer);
-    throw err;
-  }
+  const body = buildCall(method, params);
+  const bodyBuf = Buffer.from(body, "utf8");
+  // Build SCGI netstring header: "<len>:<NV pairs>,"
+  const nvPairs =
+    `CONTENT_LENGTH\0${bodyBuf.length}\0` +
+    `SCGI\x001\0` +
+    `REQUEST_METHOD\0POST\0` +
+    `CONTENT_TYPE\0text/xml\0`;
+  const nvBuf = Buffer.from(nvPairs, "utf8");
+  const requestBuf = Buffer.concat([
+    Buffer.from(`${nvBuf.length}:`),
+    nvBuf,
+    Buffer.from(","),
+    bodyBuf,
+  ]);
+  return scgiSend(requestBuf);
 }
 
 // ─── Client operations ───────────────────────────────────────────────────────
@@ -221,23 +249,27 @@ async function setSessionPeerPort(port: number): Promise<void> {
 }
 
 /**
- * Verifies that the rTorrent process is alive by executing wget from inside
- * the VPN container (which shares the network namespace with rTorrent).
- * Exit code 0 or 8 (any HTTP response) both indicate a live process.
+ * Verifies the rTorrent process is alive by attempting to connect to the SCGI
+ * socket. If the socket file exists and accepts connections, rTorrent is running.
+ * The socket is mounted directly into the watchdog container — no exec needed.
  */
 async function checkInternalHealth(): Promise<boolean> {
-  try {
-    const url = `http://localhost:${RT_PORT}${RT_RPC_PATH}`;
-    const { exitCode } = await execInContainer(VPN_CONTAINER_NAME, [
-      "wget",
-      "-qO-",
-      "--timeout=10",
-      url,
-    ]);
-    return exitCode === 0 || exitCode === 8;
-  } catch {
-    return false;
-  }
+  return new Promise((resolve) => {
+    const sock = net.createConnection({ path: RT_SOCKET_PATH });
+    const timer = setTimeout(() => {
+      sock.destroy();
+      resolve(false);
+    }, 3_000);
+    sock.on("connect", () => {
+      clearTimeout(timer);
+      sock.destroy();
+      resolve(true);
+    });
+    sock.on("error", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
 }
 
 // ─── Exported client ─────────────────────────────────────────────────────────

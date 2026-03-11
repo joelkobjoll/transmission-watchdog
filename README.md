@@ -42,11 +42,11 @@ RECOVERY (after any restart)
 
 ## Supported clients
 
-| Client           | API                                | Auth                                          |
-| ---------------- | ---------------------------------- | --------------------------------------------- |
-| **Transmission** | JSON-RPC on port 9091              | Session-ID header (no password)               |
-| **qBittorrent**  | REST Web API v2 on port 8080       | Optional cookie-based (`username`/`password`) |
-| **rTorrent**     | XML-RPC via HTTP proxy (port 8080) | None (configure in container if needed)       |
+| Client           | API                          | Auth                                          |
+| ---------------- | ---------------------------- | --------------------------------------------- |
+| **Transmission** | JSON-RPC on port 9091        | Session-ID header (no password)               |
+| **qBittorrent**  | REST Web API v2 on port 8080 | Optional cookie-based (`username`/`password`) |
+| **rTorrent**     | XML-RPC over SCGI TCP socket | None (configure in container if needed)       |
 
 All clients implement the same `TorrentClient` interface — the state machine is client-agnostic. You can monitor any client independently, or multiple simultaneously.
 
@@ -154,11 +154,23 @@ TORRENT_CLIENTS=                         # VPN-only, no torrent client
 
 ### rTorrent
 
-| Variable                  | Default    | Description                                                                                                      |
-| ------------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------- |
-| `RTORRENT_CONTAINER_NAME` | `rtorrent` | rTorrent container name                                                                                          |
-| `RTORRENT_PORT`           | `8080`     | HTTP port for the XML-RPC proxy (nginx inside `crazy-max/rtorrent-rutorrent`)                                    |
-| `RTORRENT_RPC_PATH`       | `/RPC2`    | XML-RPC endpoint path — use `/rutorrent/plugins/httprpc/action.php` for the ruTorrent httprpc plugin alternative |
+| Variable                  | Default                    | Description                                                                                       |
+| ------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------- |
+| `RTORRENT_CONTAINER_NAME` | `rtorrent`                 | rTorrent container name                                                                           |
+| `RTORRENT_SOCKET_PATH`    | `/run/rtorrent/rpc.socket` | Path to the SCGI Unix socket **inside the watchdog container** (mount it as a volume — see below) |
+
+> **rTorrent socket setup**: add `network.scgi.open_local = /run/rtorrent/rpc.socket` to `.rtorrent.rc`, then share the socket directory with the watchdog via a named volume. In the rTorrent container's compose file:
+>
+> ```yaml
+> services:
+>   rtorrent:
+>     volumes:
+>       - rtorrent_run:/run/rtorrent
+> volumes:
+>   rtorrent_run:
+> ```
+>
+> In this watchdog's `docker-compose.yml`, uncomment the `volumes:` block to attach the same named volume as `:ro`.
 
 ### Timing & polling
 
