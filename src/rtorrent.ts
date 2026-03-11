@@ -1,4 +1,3 @@
-import net from "node:net";
 import type { TorrentClient } from "./torrent-client";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -84,32 +83,51 @@ function isFault(xml: string): boolean {
 /**
  * Sends raw bytes over the rTorrent SCGI Unix socket and resolves with the
  * response body (everything after the HTTP-like \r\n\r\n header separator).
+ * Uses Bun.connect for native Unix socket support.
  */
 function scgiSend(requestBuf: Buffer): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    const socket = net.createConnection({ path: RT_SOCKET_PATH });
+    let done = false;
 
     const timer = setTimeout(() => {
-      socket.destroy();
+      done = true;
       reject(new Error("rTorrent SCGI timeout"));
     }, API_TIMEOUT_MS);
 
-    socket.on("connect", () => socket.write(requestBuf));
-    socket.on("data", (chunk: Buffer) => chunks.push(chunk));
-    socket.on("end", () => {
+    Bun.connect({
+      unix: RT_SOCKET_PATH,
+      socket: {
+        open(socket) {
+          socket.write(requestBuf);
+        },
+        data(_socket, chunk) {
+          chunks.push(Buffer.from(chunk));
+        },
+        close() {
+          if (done) return;
+          clearTimeout(timer);
+          done = true;
+          const raw = Buffer.concat(chunks).toString("utf8");
+          const sep = raw.indexOf("\r\n\r\n");
+          if (sep === -1) {
+            reject(new Error("rTorrent SCGI: malformed response"));
+            return;
+          }
+          resolve(raw.slice(sep + 4));
+        },
+        error(_socket, err) {
+          if (done) return;
+          clearTimeout(timer);
+          done = true;
+          reject(err);
+        },
+      },
+    }).catch((err) => {
+      if (done) return;
       clearTimeout(timer);
-      const raw = Buffer.concat(chunks).toString("utf8");
-      const sep = raw.indexOf("\r\n\r\n");
-      if (sep === -1) {
-        reject(new Error("rTorrent SCGI: malformed response"));
-        return;
-      }
-      resolve(raw.slice(sep + 4));
-    });
-    socket.on("error", (err: Error) => {
-      clearTimeout(timer);
-      reject(err);
+      done = true;
+      reject(err as Error);
     });
   });
 }
@@ -255,22 +273,24 @@ async function setSessionPeerPort(port: number): Promise<void> {
  * The socket is mounted directly into the watchdog container — no exec needed.
  */
 async function checkInternalHealth(): Promise<boolean> {
-  return new Promise((resolve) => {
-    const sock = net.createConnection({ path: RT_SOCKET_PATH });
-    const timer = setTimeout(() => {
-      sock.destroy();
-      resolve(false);
-    }, 3_000);
-    sock.on("connect", () => {
-      clearTimeout(timer);
-      sock.destroy();
-      resolve(true);
-    });
-    sock.on("error", () => {
-      clearTimeout(timer);
-      resolve(false);
-    });
-  });
+  const timeout = new Promise<false>((resolve) =>
+    setTimeout(() => resolve(false), 3_000),
+  );
+  const probe = Bun.connect({
+    unix: RT_SOCKET_PATH,
+    socket: {
+      open(s) {
+        s.end();
+      },
+      data() {},
+      close() {},
+      error() {},
+    },
+  }).then(
+    () => true as const,
+    () => false as const,
+  );
+  return Promise.race([probe, timeout]);
 }
 
 // ─── Exported client ─────────────────────────────────────────────────────────
