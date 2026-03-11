@@ -154,23 +154,20 @@ TORRENT_CLIENTS=                         # VPN-only, no torrent client
 
 ### rTorrent
 
-| Variable                  | Default                    | Description                                                                                       |
-| ------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------- |
-| `RTORRENT_CONTAINER_NAME` | `rtorrent`                 | rTorrent container name                                                                           |
-| `RTORRENT_SOCKET_PATH`    | `/run/rtorrent/rpc.socket` | Path to the SCGI Unix socket **inside the watchdog container** (mount it as a volume — see below) |
+| Variable                  | Default                    | Description                                                                                            |
+| ------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `RTORRENT_CONTAINER_NAME` | `rtorrent`                 | rTorrent container name                                                                                |
+| `RTORRENT_SOCKET_PATH`    | _(none)_                   | **Host** path to the socket directory — used only in `docker-compose.yml` as the bind-mount source     |
+| `RTORRENT_SCGI_SOCKET`    | `/run/rtorrent/rpc.socket` | Path to the SCGI socket **inside the watchdog container** (matches the volume mount target + filename) |
 
-> **rTorrent socket setup**: add `network.scgi.open_local = /run/rtorrent/rpc.socket` to `.rtorrent.rc`, then share the socket directory with the watchdog via a named volume. In the rTorrent container's compose file:
+> **rTorrent socket setup**: add `network.scgi.open_local = /run/rtorrent/rpc.socket` to `.rtorrent.rc`, set `RTORRENT_SOCKET_PATH` in `.env` to the host directory, then uncomment the `volumes:` block in `docker-compose.yml`:
 >
 > ```yaml
-> services:
->   rtorrent:
->     volumes:
->       - rtorrent_run:/run/rtorrent
 > volumes:
->   rtorrent_run:
+>   - ${RTORRENT_SOCKET_PATH}:/run/rtorrent:ro
 > ```
 >
-> In this watchdog's `docker-compose.yml`, uncomment the `volumes:` block to attach the same named volume as `:ro`.
+> In Dokploy, set `RTORRENT_SOCKET_PATH` per server — no hardcoded host paths needed.
 
 ### Timing & polling
 

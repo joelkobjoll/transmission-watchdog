@@ -6,12 +6,7 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    # Uncomment to share the rTorrent SCGI socket via a named volume.
-    # The rTorrent container must mount the same volume at the path where it
-    # writes network.scgi.open_local (e.g. /run/rtorrent/rpc.socket).
+    # When using rTorrent, set RTORRENT_SOCKET_PATH in .env to the host directory
+    # containing rpc.socket. Falls back to /tmp/rtorrent-disabled (harmless empty dir).
     volumes:
-      - rtorrent_run:/run/rtorrent:ro
-
-volumes:
-  rtorrent_run:
-    external: true # created and owned by the rTorrent container's compose stack
+      - ${RTORRENT_SOCKET_PATH:-/tmp/rtorrent-disabled}:/run/rtorrent:ro

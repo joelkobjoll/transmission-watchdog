@@ -3,8 +3,9 @@ import type { TorrentClient } from "./torrent-client";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
+// Full path to the socket file inside this container (the volume is mounted at /run/rtorrent).
 const RT_SOCKET_PATH =
-  process.env.RTORRENT_SOCKET_PATH ?? "/run/rtorrent/rpc.socket";
+  process.env.RTORRENT_SCGI_SOCKET ?? "/run/rtorrent/rpc.socket";
 
 export const RTORRENT_CONTAINER_NAME =
   process.env.RTORRENT_CONTAINER_NAME ?? "rtorrent";
