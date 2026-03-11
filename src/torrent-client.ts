@@ -21,6 +21,9 @@ export interface TorrentClient {
   /** Resumes/starts the given torrents. */
   startAllTorrents(ids: (number | string)[]): Promise<void>;
 
+  /** Re-announces all torrents to their trackers. */
+  reannounceAllTorrents(): Promise<void>;
+
   /**
    * Checks tracker connectivity for active torrents.
    *   true  = at least one tracker is announcing successfully.

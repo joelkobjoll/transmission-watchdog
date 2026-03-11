@@ -22,15 +22,14 @@ import {
   TRANSMISSION_CONTAINER_NAME,
 } from "./transmission";
 import { qbittorrentClient, QBITTORRENT_CONTAINER_NAME } from "./qbittorrent";
-import { rtorrentClient, RTORRENT_CONTAINER_NAME } from "./rtorrent";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 /**
  * Comma-separated list of clients to monitor.
- * Valid values: "transmission", "qbittorrent", "rtorrent"
+ * Valid values: "transmission", "qbittorrent"
  * Leave empty (or omit) to monitor no torrent client (VPN-only mode).
- * Examples: "transmission"  |  "qbittorrent"  |  "rtorrent"  |  "transmission,qbittorrent"  |  ""
+ * Examples: "transmission"  |  "qbittorrent"  |  "transmission,qbittorrent"  |  ""
  */
 const TORRENT_CLIENTS_ENV = process.env.TORRENT_CLIENTS ?? "transmission";
 
@@ -40,14 +39,12 @@ const activeClients: TorrentClient[] = TORRENT_CLIENTS_ENV.split(",")
   .map((name) => {
     if (name === "transmission") return transmissionClient;
     if (name === "qbittorrent") return qbittorrentClient;
-    if (name === "rtorrent") return rtorrentClient;
     throw new Error(
-      `Unknown TORRENT_CLIENTS entry: "${name}". Valid values: transmission, qbittorrent, rtorrent`,
+      `Unknown TORRENT_CLIENTS entry: "${name}". Valid values: transmission, qbittorrent`,
     );
   });
 
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS ?? 300_000);
-const RECOVERY_WAIT_MS = Number(process.env.RECOVERY_WAIT_MS ?? 600_000);
 const RESTART_POLL_INTERVAL_MS = Number(
   process.env.RESTART_POLL_INTERVAL_MS ?? 10_000,
 );
@@ -358,47 +355,18 @@ async function syncPeerPort(
 async function handleRecovery(clients: TorrentClient[]): Promise<void> {
   logBanner(
     "↺  RECOVERY",
-    `Stopping all torrents for ${clients.map((c) => c.clientName).join(", ")}, waiting ${RECOVERY_WAIT_MS / 1000}s, then resuming`,
+    `Re-announcing all torrents for ${clients.map((c) => c.clientName).join(", ")}`,
   );
 
-  // Stop torrents for each client; collect IDs for later resume
-  const idsByClient = new Map<string, (number | string)[]>();
   for (const client of clients) {
     try {
-      const ids = await client.getAllTorrentIds();
-      log(
-        "INFO",
-        `${client.clientName}: found ${ids.length} torrent(s) — stopping all`,
-      );
-      await client.stopAllTorrents(ids);
-      log("OK", `${client.clientName}: all torrents stopped`);
-      idsByClient.set(client.containerName, ids);
+      await client.reannounceAllTorrents();
+      log("OK", `${client.clientName}: re-announced all torrents to trackers`);
     } catch (err) {
       log(
         "ERROR",
-        `${client.clientName}: failed to stop torrents: ${err} — skipping this client`,
+        `${client.clientName}: failed to re-announce torrents: ${err}`,
       );
-    }
-  }
-
-  log(
-    "INFO",
-    `Waiting ${RECOVERY_WAIT_MS / 1000}s before re-enabling torrents...`,
-  );
-  await sleep(RECOVERY_WAIT_MS);
-
-  for (const client of clients) {
-    const ids = idsByClient.get(client.containerName);
-    if (ids === undefined) continue; // stop failed for this client earlier
-    try {
-      log("INFO", `${client.clientName}: resuming ${ids.length} torrent(s)...`);
-      await client.startAllTorrents(ids);
-      log(
-        "OK",
-        `${client.clientName}: ${ids.length} torrent(s) resumed — returning to monitoring`,
-      );
-    } catch (err) {
-      log("ERROR", `${client.clientName}: failed to resume torrents: ${err}`);
     }
   }
 }
@@ -415,7 +383,7 @@ async function main(): Promise<void> {
 
   logBanner(
     "▶  transmission-watchdog started",
-    `VPN: ${VPN_CONTAINER_NAME}  ·  Clients: ${clientSummary}  ·  interval: ${CHECK_INTERVAL_MS / 1000}s  ·  recovery wait: ${RECOVERY_WAIT_MS / 1000}s  ·  port forwarding: ${VPN_PORT_FORWARDING_ENABLED ? "enabled" : "disabled"}`,
+    `VPN: ${VPN_CONTAINER_NAME}  ·  Clients: ${clientSummary}  ·  interval: ${CHECK_INTERVAL_MS / 1000}s  ·  port forwarding: ${VPN_PORT_FORWARDING_ENABLED ? "enabled" : "disabled"}`,
   );
 
   let state: State = { tag: "MONITORING" };

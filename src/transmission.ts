@@ -91,6 +91,11 @@ export async function startAllTorrents(
   await fetchRpc({ method: "torrent-start", arguments: { ids } });
 }
 
+/** Re-announces all torrents to their trackers. */
+export async function reannounceAllTorrents(): Promise<void> {
+  await fetchRpc({ method: "torrent-reannounce", arguments: {} });
+}
+
 /** Returns the current peer-port configured in the Transmission session. */
 export async function getSessionPeerPort(): Promise<number | null> {
   try {
@@ -185,6 +190,7 @@ export const transmissionClient: TorrentClient = {
   getAllTorrentIds,
   stopAllTorrents,
   startAllTorrents,
+  reannounceAllTorrents,
   checkTrackerConnectivity,
   getSessionPeerPort,
   setSessionPeerPort,

@@ -145,6 +145,17 @@ export async function startAllTorrents(
     throw new Error(`qBittorrent startAllTorrents: HTTP ${res.status}`);
 }
 
+/** Re-announces all torrents to their trackers. */
+export async function reannounceAllTorrents(): Promise<void> {
+  const res = await apiFetch("/torrents/reannounce", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: "hashes=all",
+  });
+  if (!res.ok)
+    throw new Error(`qBittorrent reannounceAllTorrents: HTTP ${res.status}`);
+}
+
 /** Returns the current peer-listen port from qBittorrent preferences. */
 export async function getSessionPeerPort(): Promise<number | null> {
   try {
@@ -253,6 +264,7 @@ export const qbittorrentClient: TorrentClient = {
   getAllTorrentIds,
   stopAllTorrents,
   startAllTorrents,
+  reannounceAllTorrents,
   checkTrackerConnectivity,
   getSessionPeerPort,
   setSessionPeerPort,
