@@ -22,14 +22,15 @@ import {
   TRANSMISSION_CONTAINER_NAME,
 } from "./transmission";
 import { qbittorrentClient, QBITTORRENT_CONTAINER_NAME } from "./qbittorrent";
+import { rtorrentClient, RTORRENT_CONTAINER_NAME } from "./rtorrent";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 /**
  * Comma-separated list of clients to monitor.
- * Valid values: "transmission", "qbittorrent"
+ * Valid values: "transmission", "qbittorrent", "rtorrent"
  * Leave empty (or omit) to monitor no torrent client (VPN-only mode).
- * Examples: "transmission"  |  "qbittorrent"  |  "transmission,qbittorrent"  |  ""
+ * Examples: "transmission"  |  "qbittorrent"  |  "rtorrent"  |  "transmission,qbittorrent"  |  ""
  */
 const TORRENT_CLIENTS_ENV = process.env.TORRENT_CLIENTS ?? "transmission";
 
@@ -39,8 +40,9 @@ const activeClients: TorrentClient[] = TORRENT_CLIENTS_ENV.split(",")
   .map((name) => {
     if (name === "transmission") return transmissionClient;
     if (name === "qbittorrent") return qbittorrentClient;
+    if (name === "rtorrent") return rtorrentClient;
     throw new Error(
-      `Unknown TORRENT_CLIENTS entry: "${name}". Valid values: transmission, qbittorrent`,
+      `Unknown TORRENT_CLIENTS entry: "${name}". Valid values: transmission, qbittorrent, rtorrent`,
     );
   });
 

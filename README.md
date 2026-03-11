@@ -1,6 +1,6 @@
 # transmission-watchdog
 
-Bun/TypeScript daemon that monitors one or more BitTorrent containers running behind a WireGuard VPN on Unraid. Supports **Transmission** and **qBittorrent** (individually or together). Detects VPN and client failures, orchestrates clean recovery via the Docker TCP API, auto-syncs the forwarded peer-port after reconnects, and avoids destructive restarts when a client is busy moving files.
+Bun/TypeScript daemon that monitors one or more BitTorrent containers running behind a WireGuard VPN on Unraid. Supports **Transmission**, **qBittorrent**, and **rTorrent** (individually or together). Detects VPN and client failures, orchestrates clean recovery via the Docker TCP API, auto-syncs the forwarded peer-port after reconnects, and avoids destructive restarts when a client is busy moving files.
 
 ---
 
@@ -42,12 +42,13 @@ RECOVERY (after any restart)
 
 ## Supported clients
 
-| Client           | API                          | Auth                                          |
-| ---------------- | ---------------------------- | --------------------------------------------- |
-| **Transmission** | JSON-RPC on port 9091        | Session-ID header (no password)               |
-| **qBittorrent**  | REST Web API v2 on port 8080 | Optional cookie-based (`username`/`password`) |
+| Client           | API                                | Auth                                          |
+| ---------------- | ---------------------------------- | --------------------------------------------- |
+| **Transmission** | JSON-RPC on port 9091              | Session-ID header (no password)               |
+| **qBittorrent**  | REST Web API v2 on port 8080       | Optional cookie-based (`username`/`password`) |
+| **rTorrent**     | XML-RPC via HTTP proxy (port 8080) | None (configure in container if needed)       |
 
-Both clients implement the same `TorrentClient` interface — the state machine is client-agnostic. You can monitor either client independently, or both simultaneously.
+All clients implement the same `TorrentClient` interface — the state machine is client-agnostic. You can monitor any client independently, or multiple simultaneously.
 
 > **qBittorrent API version note**: The watchdog uses the v5.0+ endpoints (`/torrents/stop`, `/torrents/start`). If you run qBittorrent v4.x, update those two calls in `src/qbittorrent.ts` to `/torrents/pause` and `/torrents/resume`.
 
@@ -110,16 +111,17 @@ All settings are environment variables. Defaults are shown.
 
 ### Client selection
 
-| Variable          | Default        | Description                                                                                                                           |
-| ----------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `TORRENT_CLIENTS` | `transmission` | Comma-separated list of clients to monitor. Valid values: `transmission`, `qbittorrent`. Set to empty string for VPN-only monitoring. |
+| Variable          | Default        | Description                                                                                                                                       |
+| ----------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TORRENT_CLIENTS` | `transmission` | Comma-separated list of clients to monitor. Valid values: `transmission`, `qbittorrent`, `rtorrent`. Set to empty string for VPN-only monitoring. |
 
 Examples:
 
 ```env
 TORRENT_CLIENTS=transmission              # Transmission only
 TORRENT_CLIENTS=qbittorrent              # qBittorrent only
-TORRENT_CLIENTS=transmission,qbittorrent # both
+TORRENT_CLIENTS=rtorrent                 # rTorrent only
+TORRENT_CLIENTS=transmission,qbittorrent # Transmission + qBittorrent
 TORRENT_CLIENTS=                         # VPN-only, no torrent client
 ```
 
@@ -149,6 +151,14 @@ TORRENT_CLIENTS=                         # VPN-only, no torrent client
 | `QBITTORRENT_PORT`           | `8080`        | qBittorrent Web UI port                           |
 | `QBITTORRENT_USERNAME`       | _(empty)_     | Web UI username (leave blank if auth is disabled) |
 | `QBITTORRENT_PASSWORD`       | _(empty)_     | Web UI password (leave blank if auth is disabled) |
+
+### rTorrent
+
+| Variable                  | Default    | Description                                                                                                      |
+| ------------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------- |
+| `RTORRENT_CONTAINER_NAME` | `rtorrent` | rTorrent container name                                                                                          |
+| `RTORRENT_PORT`           | `8080`     | HTTP port for the XML-RPC proxy (nginx inside `crazy-max/rtorrent-rutorrent`)                                    |
+| `RTORRENT_RPC_PATH`       | `/RPC2`    | XML-RPC endpoint path — use `/rutorrent/plugins/httprpc/action.php` for the ruTorrent httprpc plugin alternative |
 
 ### Timing & polling
 
@@ -194,9 +204,10 @@ ANSI colours are only emitted when stdout is a TTY; piping to a file produces cl
 ```
 src/
   index.ts          State machine: MONITORING → VPN_RESTARTING / CLIENT_RESTARTING → RECOVERY
-  torrent-client.ts TorrentClient interface (implemented by both clients)
+  torrent-client.ts TorrentClient interface (implemented by all clients)
   transmission.ts   Transmission RPC client (health, torrents, peer-port sync)
   qbittorrent.ts    qBittorrent Web API client (health, torrents, peer-port sync)
+  rtorrent.ts       rTorrent XML-RPC client (health, torrents, peer-port sync)
   docker.ts         Docker TCP API client (inspect, exec, start, stop, restart)
   vpn.ts            VPN health checks (internet, IP, forwarded port)
   network.ts        Local network connectivity probe
