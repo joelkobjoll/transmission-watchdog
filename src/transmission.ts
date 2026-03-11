@@ -15,10 +15,20 @@ const VPN_CONTAINER_NAME = process.env.VPN_CONTAINER_NAME ?? "wireguard-pia";
 // Transmission requires a session ID sent back via X-Transmission-Session-Id.
 // We obtain it by making a request and reading the header from the 409 response.
 let sessionId: string | null = null;
+let rpcRequestId = 0;
 
-async function fetchRpc(body: object, retrying = false): Promise<unknown> {
+// JSON-RPC 2.0 (Transmission >= 4.1.0 / rpc_version_semver 6.0.0)
+// Request:  { jsonrpc: "2.0", method: "snake_case_method", params: {...}, id: N }
+// Response: { jsonrpc: "2.0", result: {...}, id: N }
+//        or { jsonrpc: "2.0", error: { code, message }, id: N }
+async function fetchRpc(
+  method: string,
+  params: object = {},
+  retrying = false,
+): Promise<unknown> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), RPC_TIMEOUT_MS);
+  const id = ++rpcRequestId;
 
   let res: Response;
   try {
@@ -29,7 +39,7 @@ async function fetchRpc(body: object, retrying = false): Promise<unknown> {
         "Content-Type": "application/json",
         ...(sessionId ? { "X-Transmission-Session-Id": sessionId } : {}),
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ jsonrpc: "2.0", method, params, id }),
     });
   } finally {
     clearTimeout(timer);
@@ -42,25 +52,33 @@ async function fetchRpc(body: object, retrying = false): Promise<unknown> {
     sessionId = res.headers.get("X-Transmission-Session-Id");
     if (!sessionId)
       throw new Error("Transmission RPC: 409 but no session header");
-    return fetchRpc(body, true);
+    return fetchRpc(method, params, true);
   }
 
   if (!res.ok) {
     throw new Error(`Transmission RPC: HTTP ${res.status}`);
   }
 
-  const json = (await res.json()) as { result: string; arguments?: unknown };
-  if (json.result !== "success") {
-    throw new Error(`Transmission RPC: result="${json.result}"`);
+  const json = (await res.json()) as {
+    jsonrpc: string;
+    result?: unknown;
+    error?: { code: number; message: string };
+    id: number;
+  };
+
+  if (json.error) {
+    throw new Error(
+      `Transmission RPC: ${json.error.message} (code ${json.error.code})`,
+    );
   }
 
-  return json.arguments;
+  return json.result;
 }
 
 /** Returns true if Transmission is up and responding to RPC calls. */
 export async function checkHealth(): Promise<boolean> {
   try {
-    await fetchRpc({ method: "session-get", arguments: {} });
+    await fetchRpc("session_get");
     return true;
   } catch {
     return false;
@@ -69,18 +87,17 @@ export async function checkHealth(): Promise<boolean> {
 
 /** Returns the IDs of all torrents currently known to Transmission. */
 export async function getAllTorrentIds(): Promise<number[]> {
-  const args = (await fetchRpc({
-    method: "torrent-get",
-    arguments: { fields: ["id"] },
+  const result = (await fetchRpc("torrent_get", {
+    fields: ["id"],
   })) as { torrents: Array<{ id: number }> };
 
-  return args.torrents.map((t) => t.id);
+  return result.torrents.map((t) => t.id);
 }
 
 /** Stops (pauses) all torrents. */
 export async function stopAllTorrents(ids: (number | string)[]): Promise<void> {
   if (ids.length === 0) return;
-  await fetchRpc({ method: "torrent-stop", arguments: { ids } });
+  await fetchRpc("torrent_stop", { ids });
 }
 
 /** Starts (resumes) all torrents. */
@@ -88,22 +105,21 @@ export async function startAllTorrents(
   ids: (number | string)[],
 ): Promise<void> {
   if (ids.length === 0) return;
-  await fetchRpc({ method: "torrent-start", arguments: { ids } });
+  await fetchRpc("torrent_start", { ids });
 }
 
 /** Re-announces all torrents to their trackers. */
 export async function reannounceAllTorrents(): Promise<void> {
-  await fetchRpc({ method: "torrent-reannounce", arguments: {} });
+  await fetchRpc("torrent_reannounce");
 }
 
 /** Returns the current peer-port configured in the Transmission session. */
 export async function getSessionPeerPort(): Promise<number | null> {
   try {
-    const args = (await fetchRpc({
-      method: "session-get",
-      arguments: { fields: ["peer-port"] },
-    })) as { "peer-port"?: number };
-    return args["peer-port"] ?? null;
+    const result = (await fetchRpc("session_get", {
+      fields: ["peer_port"],
+    })) as { peer_port?: number };
+    return result.peer_port ?? null;
   } catch {
     return null;
   }
@@ -111,10 +127,7 @@ export async function getSessionPeerPort(): Promise<number | null> {
 
 /** Updates the Transmission peer-port via session-set. */
 export async function setSessionPeerPort(port: number): Promise<void> {
-  await fetchRpc({
-    method: "session-set",
-    arguments: { "peer-port": port },
-  });
+  await fetchRpc("session_set", { peer_port: port });
 }
 
 /**
@@ -149,27 +162,26 @@ export async function checkInternalHealth(): Promise<boolean> {
 
 export async function checkTrackerConnectivity(): Promise<boolean | null> {
   try {
-    const args = (await fetchRpc({
-      method: "torrent-get",
-      arguments: { fields: ["trackerStats"] },
+    const result = (await fetchRpc("torrent_get", {
+      fields: ["tracker_stats"],
     })) as {
       torrents: Array<{
-        trackerStats: Array<{
-          lastAnnounceSucceeded: boolean;
-          lastAnnounceTime: number;
+        tracker_stats: Array<{
+          last_announce_succeeded: boolean;
+          last_announce_time: number;
         }>;
       }>;
     };
 
-    if (args.torrents.length === 0) return null;
+    if (result.torrents.length === 0) return null;
 
     let hasHistory = false;
     let anySuccess = false;
-    for (const torrent of args.torrents) {
-      for (const t of torrent.trackerStats) {
-        if (t.lastAnnounceTime > 0) {
+    for (const torrent of result.torrents) {
+      for (const t of torrent.tracker_stats) {
+        if (t.last_announce_time > 0) {
           hasHistory = true;
-          if (t.lastAnnounceSucceeded) anySuccess = true;
+          if (t.last_announce_succeeded) anySuccess = true;
         }
       }
     }
