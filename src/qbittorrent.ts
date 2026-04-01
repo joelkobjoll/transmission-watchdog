@@ -255,6 +255,20 @@ export async function checkInternalHealth(): Promise<boolean> {
   }
 }
 
+/** Returns the number of torrents currently in uploading (seeding) state. */
+export async function getSeedingCount(): Promise<number | null> {
+  try {
+    const res = await apiFetch("/torrents/info");
+    if (!res.ok) return null;
+    const torrents = (await res.json()) as Array<{ state: string }>;
+    return torrents.filter((t) =>
+      ["uploading", "stalledUP"].includes(t.state),
+    ).length;
+  } catch {
+    return null;
+  }
+}
+
 // ─── Client object ───────────────────────────────────────────────────────────
 
 export const qbittorrentClient: TorrentClient = {
@@ -269,4 +283,5 @@ export const qbittorrentClient: TorrentClient = {
   getSessionPeerPort,
   setSessionPeerPort,
   checkInternalHealth,
+  getSeedingCount,
 };

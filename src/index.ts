@@ -16,6 +16,7 @@ import {
   waitForVpnInternet,
 } from "./vpn";
 import { log, logBanner } from "./logger";
+import { getXBytesSeeding } from "./xbytes";
 import type { TorrentClient } from "./torrent-client";
 import {
   transmissionClient,
@@ -59,6 +60,15 @@ const CLIENT_HEALTH_RETRY_INTERVAL_MS = Number(
 const CLIENT_STOP_MAX_ATTEMPTS = 12;
 const VPN_PORT_FORWARDING_ENABLED =
   (process.env.VPN_PORT_FORWARDING_ENABLED ?? "true").toLowerCase() === "true";
+
+// ─── xBytes config ────────────────────────────────────────────────────────────
+const XBYTES_CHECK_ENABLED =
+  (process.env.XBYTES_CHECK_ENABLED ?? "false").toLowerCase() === "true";
+const XBYTES_STATUS_URL = process.env.XBYTES_STATUS_URL ?? "";
+const XBYTES_API_KEY = process.env.XBYTES_API_KEY ?? "";
+const XBYTES_DIFF_THRESHOLD = Number(process.env.XBYTES_DIFF_THRESHOLD ?? 0.10);
+const REANNOUNCE_INTERVAL_MS = Number(process.env.REANNOUNCE_INTERVAL_MS ?? 300_000);
+const REANNOUNCE_MAX_ATTEMPTS = Number(process.env.REANNOUNCE_MAX_ATTEMPTS ?? 12);
 
 // ─── Sleep helper ─────────────────────────────────────────────────────────────
 
@@ -358,15 +368,77 @@ async function handleRecovery(clients: TorrentClient[]): Promise<void> {
     `Re-announcing all torrents for ${clients.map((c) => c.clientName).join(", ")}`,
   );
 
+  // Stop all torrents before recovery to force a clean re-announce cycle
   for (const client of clients) {
     try {
-      await client.reannounceAllTorrents();
-      log("OK", `${client.clientName}: re-announced all torrents to trackers`);
+      const ids = await client.getAllTorrentIds();
+      await client.stopAllTorrents(ids);
+      log("OK", `${client.clientName}: stopped all torrents before recovery`);
     } catch (err) {
       log(
-        "ERROR",
-        `${client.clientName}: failed to re-announce torrents: ${err}`,
+        "WARN",
+        `${client.clientName}: failed to stop torrents before recovery: ${err} — continuing`,
       );
+    }
+  }
+  log("INFO", "Stopped all torrents before recovery");
+
+  // Re-announce loop
+  for (let attempt = 1; attempt <= REANNOUNCE_MAX_ATTEMPTS; attempt++) {
+    for (const client of clients) {
+      try {
+        await client.reannounceAllTorrents();
+        log("OK", `${client.clientName}: re-announced all torrents to trackers`);
+      } catch (err) {
+        log(
+          "ERROR",
+          `${client.clientName}: failed to re-announce torrents: ${err}`,
+        );
+      }
+    }
+
+    if (!XBYTES_CHECK_ENABLED || !XBYTES_STATUS_URL || clients.length === 0) {
+      // No xBytes check — single reannounce pass is sufficient
+      break;
+    }
+
+    log(
+      "INFO",
+      `[recovery] Waiting ${REANNOUNCE_INTERVAL_MS / 1000}s before checking seeding counts (attempt ${attempt}/${REANNOUNCE_MAX_ATTEMPTS})...`,
+    );
+    await sleep(REANNOUNCE_INTERVAL_MS);
+
+    const xbytesSeeding = await getXBytesSeeding(XBYTES_STATUS_URL, XBYTES_API_KEY);
+    const clientSeedingCounts = await Promise.all(
+      clients.map((c) => c.getSeedingCount()),
+    );
+    const totalClientSeeding = clientSeedingCounts.reduce<number>(
+      (sum, n) => sum + (n ?? 0),
+      0,
+    );
+
+    log(
+      "INFO",
+      `[recovery] xBytes seeding: ${xbytesSeeding ?? "unavailable"}, local client(s): ${totalClientSeeding}`,
+    );
+
+    if (xbytesSeeding !== null && xbytesSeeding > 0) {
+      const diff = Math.abs(xbytesSeeding - totalClientSeeding) / xbytesSeeding;
+      if (diff <= XBYTES_DIFF_THRESHOLD) {
+        log(
+          "OK",
+          `[recovery] Seeding counts within threshold (diff ${(diff * 100).toFixed(1)}%) — recovery complete`,
+        );
+        break;
+      }
+    }
+
+    if (attempt >= REANNOUNCE_MAX_ATTEMPTS) {
+      log(
+        "WARN",
+        `[recovery] Reached max reannounce attempts (${REANNOUNCE_MAX_ATTEMPTS}) without convergence — moving to MONITORING`,
+      );
+      break;
     }
   }
 }
@@ -580,6 +652,35 @@ async function main(): Promise<void> {
           failureCounts.set(client.containerName, 0);
           state = { tag: "CLIENT_RESTARTING", client };
           continue outer;
+        }
+      }
+
+      // ── xBytes seeding discrepancy check
+      if (XBYTES_CHECK_ENABLED && XBYTES_STATUS_URL && activeClients.length > 0) {
+        const xbytesSeeding = await getXBytesSeeding(XBYTES_STATUS_URL, XBYTES_API_KEY);
+        if (xbytesSeeding !== null && xbytesSeeding > 0) {
+          const clientSeedingCounts = await Promise.all(
+            activeClients.map((c) => c.getSeedingCount()),
+          );
+          const totalClientSeeding = clientSeedingCounts.reduce<number>(
+            (sum, n) => sum + (n ?? 0),
+            0,
+          );
+          const diff = Math.abs(xbytesSeeding - totalClientSeeding) / xbytesSeeding;
+          if (diff > XBYTES_DIFF_THRESHOLD) {
+            log(
+              "WARN",
+              `[xbytes] Seeding discrepancy detected — xBytes reports ${xbytesSeeding}, local client(s) report ${totalClientSeeding} (diff ${(diff * 100).toFixed(1)}% > threshold ${(XBYTES_DIFF_THRESHOLD * 100).toFixed(1)}%) — initiating VPN restart`,
+            );
+            failureCounts.clear();
+            state = { tag: "VPN_RESTARTING" };
+            continue outer;
+          } else {
+            log(
+              "OK",
+              `[xbytes] Seeding counts match — xBytes: ${xbytesSeeding}, local: ${totalClientSeeding} (diff ${(diff * 100).toFixed(1)}%)`,
+            );
+          }
         }
       }
 

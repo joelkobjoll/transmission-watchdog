@@ -51,4 +51,10 @@ export interface TorrentClient {
    * Returns true = client responded; false = client appears dead.
    */
   checkInternalHealth(): Promise<boolean>;
+
+  /**
+   * Returns the number of torrents currently in a seeding/uploading state.
+   * Returns null if the count cannot be determined.
+   */
+  getSeedingCount(): Promise<number | null>;
 }

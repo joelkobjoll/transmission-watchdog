@@ -193,6 +193,18 @@ export async function checkTrackerConnectivity(): Promise<boolean | null> {
   }
 }
 
+/** Returns the number of torrents currently in seeding state (status === 6). */
+export async function getSeedingCount(): Promise<number | null> {
+  try {
+    const result = (await fetchRpc("torrent_get", {
+      fields: ["status"],
+    })) as { torrents: Array<{ status: number }> };
+    return result.torrents.filter((t) => t.status === 6).length;
+  } catch {
+    return null;
+  }
+}
+
 // ─── Client object ───────────────────────────────────────────────────────────
 
 export const transmissionClient: TorrentClient = {
@@ -207,4 +219,5 @@ export const transmissionClient: TorrentClient = {
   getSessionPeerPort,
   setSessionPeerPort,
   checkInternalHealth,
+  getSeedingCount,
 };
