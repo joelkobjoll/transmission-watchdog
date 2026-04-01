@@ -1,7 +1,14 @@
 import { log } from "./logger";
 
 export interface XBytesStatus {
-  seeding: number;
+  ok: boolean;
+  ts: string;
+  services: Record<string, unknown>;
+  features: Record<string, unknown>;
+  xbytes: {
+    seeding: number;
+    cachedAt: string;
+  } | null;
 }
 
 export async function getXBytesSeeding(
@@ -15,7 +22,10 @@ export async function getXBytesSeeding(
       return null;
     }
     const data = (await res.json()) as XBytesStatus;
-    return data.seeding ?? null;
+    if (data.xbytes === null || data.xbytes === undefined) {
+      return null;
+    }
+    return data.xbytes.seeding ?? null;
   } catch (err) {
     log("WARN", `[xbytes] Failed to fetch status: ${err}`);
     return null;
